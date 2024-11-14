@@ -13,7 +13,7 @@
 # limitations under the License.
 
 GOPATH?=$(shell go env GOPATH)
-REGISTRY := $(if $(REG),$(REG),docker.io)
+REGISTRY := $(or $(REG),docker.io)
 IMAGE_REPO ?= $(REGISTRY)/dayuhub
 ARCH ?= amd64
 IMAGE_TAG ?= v1.0
