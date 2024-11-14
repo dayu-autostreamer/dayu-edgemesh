@@ -46,7 +46,7 @@ edgemesh::buildx:generate-dockerfile() {
 edgemesh::buildx::push-multi-platform-images() {
   edgemesh::buildx::prepare_env
 
-  REGISTRY=$REG
+  REGISTRY=${REG:-docker.io}
 
   for component in ${COMPONENTS[@]}; do
     echo "pushing ${PLATFORMS} image for $component"
@@ -71,7 +71,7 @@ edgemesh::buildx::build-multi-platform-images() {
 
   mkdir -p ${EDGEMESH_OUTPUT_IMAGEPATH}
   arch_array=(${PLATFORMS//,/ })
-  REGISTRY=$REG
+  REGISTRY=${REG:-docker.io}
 
   temp_dockerfile=${EDGEMESH_OUTPUT_IMAGEPATH}/buildx_dockerfile
   for component in ${COMPONENTS[@]}; do
