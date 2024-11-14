@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudzone
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tcp-echo-cloud
+  namespace: cloudzone
+  labels:
+    app: tcp-echo-cloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tcp-echo-cloud
+  template:
+    metadata:
+      labels:
+        app: tcp-echo-cloud
+    spec:
+      containers:
+        - name: tcp-echo-container
+          image: poorunga/go-echo:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TCP_PORT
+              value: "2701"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
+          ports:
+            - name: tcp-echo-port
+              containerPort: 2701
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: node-role.kubernetes.io/edge
+                  operator: DoesNotExist
+                - key: node-role.kubernetes.io/agent
+                  operator: DoesNotExist
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tcp-echo-cloud-svc
+  namespace: cloudzone
+  labels:
+    app: tcp-echo-cloud
+spec:
+  selector:
+    app: tcp-echo-cloud
+  ports:
+    - name: tcp-0
+      protocol: TCP
+      port: 2701
+      targetPort: 2701
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: busybox-sleep-cloud
+  namespace: cloudzone
+  labels:
+    app: busybox-sleep-cloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: busybox-sleep-cloud
+  template:
+    metadata:
+      labels:
+        app: busybox-sleep-cloud
+    spec:
+      containers:
+        - name: busybox
+          image: busybox:1.28
+          imagePullPolicy: IfNotPresent
+          args:
+            - sleep
+            - "12000"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: node-role.kubernetes.io/edge
+                  operator: DoesNotExist
+                - key: node-role.kubernetes.io/agent
+                  operator: DoesNotExist

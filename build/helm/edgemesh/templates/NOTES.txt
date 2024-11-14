@@ -1,0 +1,5 @@
+*******************
+***** SUCCESS *****
+*******************
+* Visit https://edgemesh.netlify.app/reference/config-items.html#helm-configuration for more configuration information.
+* 访问 https://edgemesh.netlify.app/zh/reference/config-items.html#helm-配置 以了解更多的配置信息。

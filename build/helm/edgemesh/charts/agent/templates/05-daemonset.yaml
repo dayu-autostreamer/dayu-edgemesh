@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    k8s-app: kubeedge
+    kubeedge: edgemesh-agent
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kubeedge
+      kubeedge: edgemesh-agent
+  template:
+    metadata:
+      labels:
+        k8s-app: kubeedge
+        kubeedge: edgemesh-agent
+    spec:
+      hostNetwork: true
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Release.Name }}-agent
+          securityContext:
+            privileged: true
+          image: {{ .Values.image }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/edgemesh/config
+            - name: resolv
+              mountPath: /etc/resolv.conf
+            - name: host-time
+              mountPath: /etc/localtime
+              readOnly: true
+            - name: psk
+              mountPath: /etc/edgemesh
+            {{- if .Values.metaServerSecret }}
+            - name: metaserver-certs
+              mountPath: /etc/edgemesh/metaserver
+            {{- end }}
+      restartPolicy: Always
+      serviceAccountName: {{ .Release.Name }}-agent
+      volumes:
+        - name: conf
+          configMap:
+            name: {{ .Release.Name }}-agent-cfg
+        - name: resolv
+          hostPath:
+            path: /etc/resolv.conf
+        - name: host-time
+          hostPath:
+            path: /etc/localtime
+        - name: psk
+          configMap:
+            name: {{ .Release.Name }}-agent-psk
+        {{- if .Values.metaServerSecret }}
+        - name: metaserver-certs
+          secret:
+            secretName: {{ .Values.metaServerSecret }}
+            defaultMode: 420
+        {{- end }}
