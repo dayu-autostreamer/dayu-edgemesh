@@ -23,7 +23,7 @@ spec:
         - name: edgemesh-gateway
           securityContext:
             privileged: true
-          image: repo:5000/kubeedge/edgemesh-gateway:v1.17.0-nobalance
+          image: dayuhub/edgemesh-gateway:v1.0
           imagePullPolicy: Always
           env:
             - name: NODE_NAME

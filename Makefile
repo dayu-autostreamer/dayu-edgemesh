@@ -13,9 +13,11 @@
 # limitations under the License.
 
 GOPATH?=$(shell go env GOPATH)
-IMAGE_REPO ?= 114.212.87.136:5000/kubeedge
+REGISTRY ?= $(REG)
+REGISTRY ?= docker.io
+IMAGE_REPO ?= $(REGISTRY)/dayuhub
 ARCH ?= amd64
-IMAGE_TAG ?= v1.17.0-nobalance
+IMAGE_TAG ?= v1.0
 GO_LDFLAGS='$(shell hack/make-rules/version.sh)'
 
 # make all builds both agent and server binaries

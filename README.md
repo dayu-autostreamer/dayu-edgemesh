@@ -19,6 +19,7 @@ git clone https://github.com/dayu-autostreamer/dayu-edgemesh
 ```
 
 deploy crds
+(specify the image if necessary)
 ```bash
 kubectl apply -f build/crds/istio/
 kubectl apply -f build/agent/resources/

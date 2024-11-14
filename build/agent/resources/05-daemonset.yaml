@@ -22,7 +22,7 @@ spec:
       - name: edgemesh-agent
         securityContext:
           privileged: true
-        image: repo:5000/kubeedge/edgemesh-agent:v1.17.0-nobalance
+        image: dayuhub/edgemesh-agent:v1.0
         imagePullPolicy: Always
         env:
         - name: NODE_NAME
