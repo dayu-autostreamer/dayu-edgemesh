@@ -21,7 +21,7 @@ git clone https://github.com/dayu-autostreamer/dayu-edgemesh
 add relay node
 ```bash
 vim build/agent/resources/04-configmap.yaml
-# add cloud server ip as relay node
+# add cloud server as relay node
 ```
 
 deploy crds
