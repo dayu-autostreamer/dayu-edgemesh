@@ -984,6 +984,7 @@ func (lb *LoadBalancer) dialEndpoint(protocol, endpoint string) (net.Conn, error
 	if !ok {
 		return nil, fmt.Errorf("invalid endpoint %s", endpoint)
 	}
+    klog.Infof("Parse endpoint, target address: %s", net.JoinHostPort(targetIP, targetPort))
 
 	switch targetNode {
 	case defaults.EmptyNodeName, lb.Config.NodeName:

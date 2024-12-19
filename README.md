@@ -18,6 +18,12 @@ clone repository
 git clone https://github.com/dayu-autostreamer/dayu-edgemesh
 ```
 
+add relay node
+```bash
+vim build/agent/resources/04-configmap.yaml
+# add cloud server ip as relay node
+```
+
 deploy crds
 (specify the image if necessary)
 ```bash
@@ -29,6 +35,13 @@ check edgemesh is running
 ```bash
 kubectl get pods -n kubeedge
 ```
+
+uninstall edgemesh
+```bash
+kubectl delete -f build/crds/istio/
+kubectl delete -f build/agent/resources/
+```
+
 
 ## How to Build 
 
