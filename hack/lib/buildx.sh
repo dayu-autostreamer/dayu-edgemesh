@@ -20,6 +20,35 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+edgemesh::buildx::read_driver_opts() {
+  local driver_opts_file="$1"
+  local -n _driver_opts_array="$2"
+
+  _driver_opts_array=()
+  if [[ -f "$driver_opts_file" ]]; then
+
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+      if [[ "$line" =~ = ]]; then
+            key=$(echo "$line" | awk -F'=' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')
+            value=$(echo "$line" | awk -F'=' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+            value=$(echo "$value" | sed 's/^"\(.*\)"$/\1/')
+            if [[ "$value" =~ , ]]; then
+                _driver_opts_array+=( --driver-opt \"$key=$value\" )
+            else
+              _driver_opts_array+=( --driver-opt "$key=$value" )
+            fi
+
+      fi
+
+    done < "$driver_opts_file"
+
+  fi
+  echo "driver opts in buildx creating: " "${_driver_opts_array[@]}"
+}
+
+
 edgemesh::buildx::prepare_env() {
   # Check whether buildx exists.
   if ! docker buildx >/dev/null 2>&1; then
@@ -31,11 +60,21 @@ edgemesh::buildx::prepare_env() {
   docker run --privileged --rm tonistiigi/binfmt --install all
 
   # Create a new builder which gives access to the new multi-architecture features.
-  builder_instance="edgemesh-buildx"
-  if ! docker buildx inspect $builder_instance >/dev/null 2>&1; then
-    docker buildx create --use --name $builder_instance --driver docker-container --config "${EDGEMESH_ROOT}"/hack/resource/buildkitd.toml
+  local BUILDER_INSTANCE="edgemesh-buildx"
+  local BUILDKIT_CONFIG_FILE="${DAYU_ROOT}/hack/resource/buildkitd.toml"
+  local DRIVER_OPTS_FILE="${DAYU_ROOT}/hack/resource/driver_opts.toml"
+
+  if ! docker buildx inspect $BUILDER_INSTANCE >/dev/null 2>&1; then
+    local -a DRIVER_OPTS=()
+    dayu::buildx::read_driver_opts "$DRIVER_OPTS_FILE" DRIVER_OPTS
+     docker buildx create \
+      --use \
+      --name "$BUILDER_INSTANCE" \
+      --driver docker-container \
+      --config "$BUILDKIT_CONFIG_FILE" \
+      "${DRIVER_OPTS[@]}"
   fi
-  docker buildx use $builder_instance
+  docker buildx use $BUILDER_INSTANCE
 }
 
 edgemesh::buildx:generate-dockerfile() {

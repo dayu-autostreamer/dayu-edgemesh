@@ -52,8 +52,10 @@ git clone https://github.com/dayu-autostreamer/dayu-edgemesh
 
 set meta information of building
 ```bash
-# configure buildx (default as empty, example at hack/resource/buildkitd_template.toml)
+# configure buildx buildkitd (default as empty, example at hack/resource/buildkitd_template.toml)
 vim hack/resource/buildkitd.toml
+# configure buildx driver-opt (default as empty, example at hack/resource/driver_opts_template.toml)
+vim hack/resource/driver_opts.toml
 
 # set docker meta info
 # default REG is docker.io
