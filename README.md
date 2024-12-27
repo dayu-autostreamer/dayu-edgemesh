@@ -50,6 +50,20 @@ clone repository
 git clone https://github.com/dayu-autostreamer/dayu-edgemesh
 ```
 
+set meta information of building
+```bash
+# configure buildx (default as empty, example at hack/resource/buildkitd_template.toml)
+vim hack/resource/buildkitd.toml
+
+# set docker meta info
+# default REG is docker.io
+# default REPO is dayuhub
+# default TAG is v1.0
+export REG=xxx
+export REPO=xxx
+export TAG=xxx
+```
+
 Cross build edgemesh-agent and edgemesh-server image
 ```bash
 make docker-cross-build

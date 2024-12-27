@@ -1,0 +1,9 @@
+insecure-entitlements=["114.212.87.136:5000","repo:5000"]
+
+[registry."repo:5000"]
+  http = true
+  insecure = true
+
+[registry."114.212.87.136:5000"]
+  http = true
+  insecure = true
