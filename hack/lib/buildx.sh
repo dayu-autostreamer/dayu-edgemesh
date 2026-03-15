@@ -66,7 +66,7 @@ edgemesh::buildx::prepare_env() {
 
   if ! docker buildx inspect $BUILDER_INSTANCE >/dev/null 2>&1; then
     local -a DRIVER_OPTS=()
-    dayu::buildx::read_driver_opts "$DRIVER_OPTS_FILE" DRIVER_OPTS
+    edgemesh::buildx::read_driver_opts "$DRIVER_OPTS_FILE" DRIVER_OPTS
      docker buildx create \
       --use \
       --name "$BUILDER_INSTANCE" \
