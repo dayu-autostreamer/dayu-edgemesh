@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,6 +127,11 @@ const numBurstSyncs int = 2
 type serviceChange struct {
 	current  *v1.Service
 	previous *v1.Service
+}
+
+type serviceChangeEntry struct {
+	name   types.NamespacedName
+	change *serviceChange
 }
 
 // Interface for async runner; abstracted for testing
@@ -397,9 +403,10 @@ func (proxier *Proxier) syncProxyRules() {
 	defer proxier.mu.Unlock()
 
 	klog.V(4).InfoS("userspace proxy: processing service events", "count", len(changes))
-	for _, change := range changes {
-		existingPorts := proxier.mergeService(change.current)
-		proxier.unmergeService(change.previous, existingPorts)
+	for _, entry := range orderedServiceChanges(changes) {
+		existingPorts := servicePortNames(entry.change.current)
+		proxier.unmergeService(entry.change.previous, existingPorts)
+		proxier.mergeService(entry.change.current)
 	}
 
 	proxier.localAddrs = utilproxy.GetLocalAddrSet()
@@ -495,6 +502,52 @@ func (proxier *Proxier) cleanupPortalAndProxy(serviceName proxy.ServicePortName,
 	return nil
 }
 
+func orderedServiceChanges(changes map[types.NamespacedName]*serviceChange) []serviceChangeEntry {
+	entries := make([]serviceChangeEntry, 0, len(changes))
+	for name, change := range changes {
+		entries = append(entries, serviceChangeEntry{name: name, change: change})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		leftOrder := serviceChangeOrder(entries[i].change)
+		rightOrder := serviceChangeOrder(entries[j].change)
+		if leftOrder != rightOrder {
+			return leftOrder < rightOrder
+		}
+		if entries[i].name.Namespace != entries[j].name.Namespace {
+			return entries[i].name.Namespace < entries[j].name.Namespace
+		}
+		return entries[i].name.Name < entries[j].name.Name
+	})
+
+	return entries
+}
+
+func serviceChangeOrder(change *serviceChange) int {
+	switch {
+	case change == nil:
+		return 3
+	case change.previous != nil && change.current == nil:
+		return 0
+	case change.previous != nil:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func servicePortNames(service *v1.Service) sets.String {
+	if service == nil || utilproxy.ShouldSkipService(service) {
+		return nil
+	}
+
+	existingPorts := sets.NewString()
+	for i := range service.Spec.Ports {
+		existingPorts.Insert(service.Spec.Ports[i].Name)
+	}
+	return existingPorts
+}
+
 func (proxier *Proxier) mergeService(service *v1.Service) sets.String {
 	if service == nil {
 		return nil
@@ -502,12 +555,11 @@ func (proxier *Proxier) mergeService(service *v1.Service) sets.String {
 	if utilproxy.ShouldSkipService(service) {
 		return nil
 	}
-	existingPorts := sets.NewString()
+	existingPorts := servicePortNames(service)
 	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
 		serviceName := proxy.ServicePortName{NamespacedName: svcName, Port: servicePort.Name}
-		existingPorts.Insert(servicePort.Name)
 		info, exists := proxier.serviceMap[serviceName]
 		// TODO: check health of the socket? What if ProxyLoop exited?
 		if exists && sameConfig(info, service, servicePort) {
