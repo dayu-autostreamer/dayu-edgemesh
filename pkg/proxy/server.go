@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	istioclientset "istio.io/client-go/pkg/clientset/versioned"
@@ -17,6 +21,7 @@ import (
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/proxy"
 	proxyconfigapi "k8s.io/kubernetes/pkg/proxy/apis/config"
@@ -135,20 +140,16 @@ func (s *Server) Run() error {
 	validationServiceInformerFactory := informerFactory
 	validationNamespaceInformerFactory := namespaceInformerFactory
 	validationClient := s.kubeClient
-	if inClusterConfig, err := rest.InClusterConfig(); err == nil {
-		if directClient, directErr := clientset.NewForConfig(inClusterConfig); directErr == nil {
-			validationClient = directClient
-			validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
-				informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-					options.LabelSelector = labelSelector.String()
-				}))
-			validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
-			klog.InfoS("Using direct Kubernetes API validation source for EdgeMesh proxy state")
-		} else {
-			klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", directErr)
-		}
+	if directValidationClient, source, err := buildValidationClient(s.kubeClient); err == nil {
+		validationClient = directValidationClient
+		validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
+			informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+				options.LabelSelector = labelSelector.String()
+			}))
+		validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
+		klog.InfoS("Using independent Kubernetes API validation source for EdgeMesh proxy state", "source", source)
 	} else {
-		klog.V(2).InfoS("In-cluster Kubernetes API validation source unavailable; falling back to primary Kubernetes client", "err", err)
+		klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", err)
 	}
 	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
 	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
@@ -244,6 +245,197 @@ func (s *Server) Run() error {
 	go s.Proxier.SyncLoop()
 
 	return nil
+}
+
+func buildValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
+	var errs []error
+	if directClient, source, err := buildInClusterValidationClient(primaryClient); err == nil {
+		return directClient, source, nil
+	} else {
+		errs = append(errs, err)
+	}
+
+	if validationClient, source, err := buildKubeconfigValidationClient(); err == nil {
+		return validationClient, source, nil
+	} else {
+		errs = append(errs, err)
+	}
+
+	return nil, "", joinValidationErrors(errs)
+}
+
+func buildKubeconfigValidationClient() (clientset.Interface, string, error) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: load config failed: %w", err)
+	}
+	if isMetaServerHost(kubeConfig.Host) {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: discovered kubeconfig still points to MetaServer host %q", kubeConfig.Host)
+	}
+
+	kubeConfig = rest.CopyConfig(kubeConfig)
+	kubeConfig.Timeout = 3 * time.Second
+	validationClient, err := clientset.NewForConfig(kubeConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: build client failed: %w", err)
+	}
+	if err := validateClientReachability(validationClient); err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: client is unreachable: %w", err)
+	}
+
+	return validationClient, fmt.Sprintf("kubeconfig:%s", kubeConfig.Host), nil
+}
+
+func buildInClusterValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
+	inClusterConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, "", fmt.Errorf("in-cluster config unavailable: %w", err)
+	}
+
+	directConfig := rest.CopyConfig(inClusterConfig)
+	directConfig.Timeout = 3 * time.Second
+	directClient, err := clientset.NewForConfig(directConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("build in-cluster client failed: %w", err)
+	}
+	directReachabilityErr := validateClientReachability(directClient)
+	if directReachabilityErr == nil {
+		return directClient, fmt.Sprintf("in-cluster:%s", directConfig.Host), nil
+	}
+
+	endpointHost, err := discoverKubernetesEndpointHost(primaryClient)
+	if err != nil {
+		return nil, "", fmt.Errorf("in-cluster client %q is unreachable: %v; kubernetes endpoints discovery failed: %w", directConfig.Host, directReachabilityErr, err)
+	}
+
+	endpointConfig := rest.CopyConfig(inClusterConfig)
+	endpointConfig.Host = endpointHost
+	endpointConfig.Timeout = 3 * time.Second
+	endpointConfig.TLSClientConfig.ServerName = "kubernetes.default.svc"
+
+	endpointClient, err := clientset.NewForConfig(endpointConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("build endpoint validation client failed: %w", err)
+	}
+	if err := validateClientReachability(endpointClient); err != nil {
+		return nil, "", fmt.Errorf("in-cluster client %q is unreachable: %v; endpoint validation client %q is unreachable: %w", directConfig.Host, directReachabilityErr, endpointHost, err)
+	}
+
+	return endpointClient, fmt.Sprintf("kubernetes-endpoint:%s", endpointHost), nil
+}
+
+func validateClientReachability(client clientset.Interface) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := client.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func discoverKubernetesEndpointHost(primaryClient clientset.Interface) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	endpoints, err := primaryClient.CoreV1().Endpoints("default").Get(ctx, "kubernetes", metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get default/kubernetes endpoints failed: %w", err)
+	}
+
+	return kubernetesEndpointHost(endpoints)
+}
+
+func kubernetesEndpointHost(endpoints *v1.Endpoints) (string, error) {
+	if endpoints == nil {
+		return "", errors.New("default/kubernetes endpoints are nil")
+	}
+
+	for _, subset := range endpoints.Subsets {
+		port, found := preferredEndpointPort(subset.Ports)
+		if !found {
+			continue
+		}
+		for _, address := range subset.Addresses {
+			if address.IP == "" {
+				continue
+			}
+			return fmt.Sprintf("https://%s", net.JoinHostPort(address.IP, strconv.Itoa(int(port)))), nil
+		}
+	}
+
+	return "", errors.New("default/kubernetes endpoints do not contain a ready address with a TCP port")
+}
+
+func preferredEndpointPort(ports []v1.EndpointPort) (int32, bool) {
+	var firstTCPPort int32
+	for _, port := range ports {
+		if port.Protocol != "" && port.Protocol != v1.ProtocolTCP {
+			continue
+		}
+		if firstTCPPort == 0 {
+			firstTCPPort = port.Port
+		}
+		if port.Name == "https" || port.Port == 443 {
+			return port.Port, true
+		}
+	}
+	if firstTCPPort == 0 {
+		return 0, false
+	}
+	return firstTCPPort, true
+}
+
+func isMetaServerHost(host string) bool {
+	if host == "" {
+		return false
+	}
+
+	rawHost := host
+	if strings.Contains(rawHost, "://") {
+		parsedURL, err := url.Parse(rawHost)
+		if err == nil && parsedURL.Host != "" {
+			rawHost = parsedURL.Host
+		}
+	}
+
+	hostname := rawHost
+	port := ""
+	if parsedHost, parsedPort, err := net.SplitHostPort(rawHost); err == nil {
+		hostname = parsedHost
+		port = parsedPort
+	}
+
+	hostname = strings.Trim(hostname, "[]")
+	if port != "10550" {
+		return false
+	}
+
+	switch strings.ToLower(hostname) {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
+func joinValidationErrors(errs []error) error {
+	messages := make([]string, 0, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		messages = append(messages, err.Error())
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(messages, "; "))
 }
 
 // CleanupAndExit remove iptables rules
