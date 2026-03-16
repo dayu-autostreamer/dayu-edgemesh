@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +36,12 @@ import (
 	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
 	"github.com/kubeedge/edgemesh/pkg/loadbalancer"
+	kubeedgeconstants "github.com/kubeedge/kubeedge/common/constants"
+)
+
+const (
+	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	serviceAccountCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )
 
 // Copy and update from https://github.com/kubernetes/kubernetes/blob/v1.23.0/cmd/kube-proxy/app/server.go and
@@ -255,6 +263,12 @@ func buildValidationClient(primaryClient clientset.Interface) (clientset.Interfa
 		errs = append(errs, err)
 	}
 
+	if validationClient, source, err := buildServiceAccountValidationClient(primaryClient); err == nil {
+		return validationClient, source, nil
+	} else {
+		errs = append(errs, err)
+	}
+
 	if validationClient, source, err := buildKubeconfigValidationClient(); err == nil {
 		return validationClient, source, nil
 	} else {
@@ -264,30 +278,37 @@ func buildValidationClient(primaryClient clientset.Interface) (clientset.Interfa
 	return nil, "", joinValidationErrors(errs)
 }
 
-func buildKubeconfigValidationClient() (clientset.Interface, string, error) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		loadingRules,
-		&clientcmd.ConfigOverrides{},
-	).ClientConfig()
+func buildServiceAccountValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
+	endpointHost, err := discoverKubernetesEndpointHost(primaryClient)
 	if err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: load config failed: %w", err)
+		return nil, "", fmt.Errorf("serviceaccount validation unavailable: kubernetes endpoints discovery failed: %w", err)
 	}
-	if isMetaServerHost(kubeConfig.Host) {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: discovered kubeconfig still points to MetaServer host %q", kubeConfig.Host)
+	if err := ensureReadableFile(serviceAccountTokenPath); err != nil {
+		return nil, "", fmt.Errorf("serviceaccount validation unavailable: token file %q is unavailable: %w", serviceAccountTokenPath, err)
+	}
+	if err := ensureReadableFile(serviceAccountCAPath); err != nil {
+		return nil, "", fmt.Errorf("serviceaccount validation unavailable: ca file %q is unavailable: %w", serviceAccountCAPath, err)
 	}
 
-	kubeConfig = rest.CopyConfig(kubeConfig)
-	kubeConfig.Timeout = 3 * time.Second
-	validationClient, err := clientset.NewForConfig(kubeConfig)
+	serviceAccountConfig := &rest.Config{
+		Host:            endpointHost,
+		BearerTokenFile: serviceAccountTokenPath,
+		Timeout:         3 * time.Second,
+		TLSClientConfig: rest.TLSClientConfig{
+			CAFile:     serviceAccountCAPath,
+			ServerName: "kubernetes.default.svc",
+		},
+	}
+
+	validationClient, err := clientset.NewForConfig(serviceAccountConfig)
 	if err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: build client failed: %w", err)
+		return nil, "", fmt.Errorf("serviceaccount validation unavailable: build client failed: %w", err)
 	}
 	if err := validateClientReachability(validationClient); err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: client is unreachable: %w", err)
+		return nil, "", fmt.Errorf("serviceaccount validation unavailable: client %q is unreachable: %w", endpointHost, err)
 	}
 
-	return validationClient, fmt.Sprintf("kubeconfig:%s", kubeConfig.Host), nil
+	return validationClient, fmt.Sprintf("serviceaccount-endpoint:%s", endpointHost), nil
 }
 
 func buildInClusterValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
@@ -349,6 +370,17 @@ func discoverKubernetesEndpointHost(primaryClient clientset.Interface) (string, 
 	}
 
 	return kubernetesEndpointHost(endpoints)
+}
+
+func ensureReadableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	return nil
 }
 
 func kubernetesEndpointHost(endpoints *v1.Endpoints) (string, error) {
@@ -436,6 +468,97 @@ func joinValidationErrors(errs []error) error {
 		return nil
 	}
 	return errors.New(strings.Join(messages, "; "))
+}
+
+func buildKubeconfigValidationClient() (clientset.Interface, string, error) {
+	var errs []error
+	if validationClient, source, err := buildValidationClientFromLoadingRules(); err == nil {
+		return validationClient, source, nil
+	} else {
+		errs = append(errs, err)
+	}
+
+	for _, kubeConfigPath := range kubeconfigCandidatePaths() {
+		if err := ensureReadableFile(kubeConfigPath); err != nil {
+			errs = append(errs, fmt.Errorf("kubeconfig validation unavailable: kubeconfig path %q is unavailable: %w", kubeConfigPath, err))
+			continue
+		}
+		validationClient, source, err := buildValidationClientFromPath(kubeConfigPath)
+		if err == nil {
+			return validationClient, source, nil
+		}
+		errs = append(errs, err)
+	}
+
+	return nil, "", joinValidationErrors(errs)
+}
+
+func buildValidationClientFromLoadingRules() (clientset.Interface, string, error) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: load config failed: %w", err)
+	}
+	return buildValidationClientFromConfig(kubeConfig, fmt.Sprintf("kubeconfig:%s", kubeConfig.Host))
+}
+
+func buildValidationClientFromPath(kubeConfigPath string) (clientset.Interface, string, error) {
+	kubeConfig, err := clientcmd.BuildConfigFromFlags("", kubeConfigPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: load config from %q failed: %w", kubeConfigPath, err)
+	}
+	return buildValidationClientFromConfig(kubeConfig, fmt.Sprintf("kubeconfig-file:%s", kubeConfigPath))
+}
+
+func buildValidationClientFromConfig(kubeConfig *rest.Config, source string) (clientset.Interface, string, error) {
+	if kubeConfig == nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: config for %s is nil", source)
+	}
+	if isMetaServerHost(kubeConfig.Host) {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: %s points to MetaServer host %q", source, kubeConfig.Host)
+	}
+
+	kubeConfig = rest.CopyConfig(kubeConfig)
+	kubeConfig.Timeout = 3 * time.Second
+	validationClient, err := clientset.NewForConfig(kubeConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: build client for %s failed: %w", source, err)
+	}
+	if err := validateClientReachability(validationClient); err != nil {
+		return nil, "", fmt.Errorf("kubeconfig validation unavailable: client for %s is unreachable: %w", source, err)
+	}
+
+	return validationClient, source, nil
+}
+
+func kubeconfigCandidatePaths() []string {
+	paths := []string{
+		kubeedgeconstants.DefaultKubeletConfig,
+		"/root/.kube/config",
+		"/etc/kubernetes/admin.conf",
+		"/etc/rancher/k3s/k3s.yaml",
+	}
+
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		paths = append(paths, filepath.Join(homeDir, ".kube", "config"))
+	}
+
+	seen := make(map[string]struct{}, len(paths))
+	deduped := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		deduped = append(deduped, path)
+	}
+	return deduped
 }
 
 // CleanupAndExit remove iptables rules
