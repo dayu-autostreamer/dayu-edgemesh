@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/proxy"
 	proxyconfigapi "k8s.io/kubernetes/pkg/proxy/apis/config"
@@ -129,25 +131,48 @@ func (s *Server) Run() error {
 			options.LabelSelector = labelSelector.String()
 		}))
 	namespaceInformerFactory := informers.NewSharedInformerFactory(s.kubeClient, s.ConfigSyncPeriod)
+	validationServiceInformerFactory := informerFactory
+	validationNamespaceInformerFactory := namespaceInformerFactory
+	validationClient := s.kubeClient
+	if inClusterConfig, err := rest.InClusterConfig(); err == nil {
+		if directClient, directErr := clientset.NewForConfig(inClusterConfig); directErr == nil {
+			validationClient = directClient
+			validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
+				informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+					options.LabelSelector = labelSelector.String()
+				}))
+			validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
+			klog.InfoS("Using direct Kubernetes API validation source for EdgeMesh proxy state")
+		} else {
+			klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", directErr)
+		}
+	} else {
+		klog.V(2).InfoS("In-cluster Kubernetes API validation source unavailable; falling back to primary Kubernetes client", "err", err)
+	}
 	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
 	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
 	// only notify on changes, and the initial update (on process start) may be lost if no handlers
 	// are registered yet.
 	serviceInformer := informerFactory.Core().V1().Services()
 	namespaceInformer := namespaceInformerFactory.Core().V1().Namespaces()
+	validationServiceInformer := validationServiceInformerFactory.Core().V1().Services()
+	validationNamespaceInformer := validationNamespaceInformerFactory.Core().V1().Namespaces()
 	if userspaceProxier, ok := s.Proxier.(*userspace.Proxier); ok {
+		userspaceProxier.SetValidationReadyHandler(func() bool {
+			return validationServiceInformer.Informer().HasSynced() && validationNamespaceInformer.Informer().HasSynced()
+		})
 		userspaceProxier.SetNamespaceExistsHandler(func(namespace string) bool {
-			if !namespaceInformer.Informer().HasSynced() {
+			if !validationNamespaceInformer.Informer().HasSynced() {
 				return true
 			}
-			_, err := namespaceInformer.Lister().Get(namespace)
+			_, err := validationNamespaceInformer.Lister().Get(namespace)
 			return err == nil
 		})
 		userspaceProxier.SetServiceExistsHandler(func(servicePort proxy.ServicePortName) bool {
-			if !serviceInformer.Informer().HasSynced() {
+			if !validationServiceInformer.Informer().HasSynced() {
 				return true
 			}
-			service, err := serviceInformer.Lister().Services(servicePort.NamespacedName.Namespace).Get(servicePort.NamespacedName.Name)
+			service, err := validationServiceInformer.Lister().Services(servicePort.NamespacedName.Namespace).Get(servicePort.NamespacedName.Name)
 			if err != nil {
 				return false
 			}
@@ -173,6 +198,20 @@ func (s *Server) Run() error {
 	// functions must configure their shared informer event handlers first.
 	informerFactory.Start(wait.NeverStop)
 	namespaceInformerFactory.Start(wait.NeverStop)
+	if validationClient != s.kubeClient {
+		validationServiceInformerFactory.Start(wait.NeverStop)
+		validationNamespaceInformerFactory.Start(wait.NeverStop)
+	}
+	if userspaceProxier, ok := s.Proxier.(*userspace.Proxier); ok {
+		go func() {
+			if cache.WaitForNamedCacheSync("userspace proxy validation", wait.NeverStop,
+				validationServiceInformer.Informer().HasSynced,
+				validationNamespaceInformer.Informer().HasSynced,
+			) {
+				userspaceProxier.Sync()
+			}
+		}()
+	}
 
 	// Run loadBalancer
 	s.loadBalancer.Config.Caller = defaults.ProxyCaller

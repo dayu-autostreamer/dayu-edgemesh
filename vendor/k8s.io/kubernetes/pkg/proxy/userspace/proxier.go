@@ -136,6 +136,7 @@ type serviceChangeEntry struct {
 
 type NamespaceExistsFunc func(namespace string) bool
 type ServiceExistsFunc func(service proxy.ServicePortName) bool
+type ValidationReadyFunc func() bool
 
 // Interface for async runner; abstracted for testing
 type asyncRunnerInterface interface {
@@ -168,6 +169,7 @@ type Proxier struct {
 	exec            utilexec.Interface
 	namespaceExists NamespaceExistsFunc
 	serviceExists   ServiceExistsFunc
+	validationReady ValidationReadyFunc
 	// endpointsSynced and servicesSynced are set to 1 when the corresponding
 	// objects are synced after startup. This is used to avoid updating iptables
 	// with some partial data after kube-proxy restart.
@@ -394,6 +396,10 @@ func (proxier *Proxier) syncProxyRules() {
 		klog.V(2).InfoS("Not syncing userspace proxy until Services and Endpoints have been received from master")
 		return
 	}
+	if proxier.validationReady != nil && !proxier.validationReady() {
+		klog.V(2).InfoS("Not syncing userspace proxy until validation sources have been received")
+		return
+	}
 
 	if err := iptablesInit(proxier.iptables); err != nil {
 		klog.ErrorS(err, "Failed to ensure iptables")
@@ -470,6 +476,12 @@ func (proxier *Proxier) SetServiceExistsHandler(handler ServiceExistsFunc) {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	proxier.serviceExists = handler
+}
+
+func (proxier *Proxier) SetValidationReadyHandler(handler ValidationReadyFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.validationReady = handler
 }
 
 // addServiceOnPortInternal starts listening for a new service, returning the ServiceInfo.
