@@ -136,7 +136,6 @@ type serviceChangeEntry struct {
 
 type NamespaceExistsFunc func(namespace string) bool
 type ServiceExistsFunc func(service proxy.ServicePortName) bool
-type ValidationReadyFunc func() bool
 
 // Interface for async runner; abstracted for testing
 type asyncRunnerInterface interface {
@@ -169,7 +168,6 @@ type Proxier struct {
 	exec            utilexec.Interface
 	namespaceExists NamespaceExistsFunc
 	serviceExists   ServiceExistsFunc
-	validationReady ValidationReadyFunc
 	// endpointsSynced and servicesSynced are set to 1 when the corresponding
 	// objects are synced after startup. This is used to avoid updating iptables
 	// with some partial data after kube-proxy restart.
@@ -396,10 +394,6 @@ func (proxier *Proxier) syncProxyRules() {
 		klog.V(2).InfoS("Not syncing userspace proxy until Services and Endpoints have been received from master")
 		return
 	}
-	if proxier.validationReady != nil && !proxier.validationReady() {
-		klog.V(2).InfoS("Not syncing userspace proxy until validation sources have been received")
-		return
-	}
 
 	if err := iptablesInit(proxier.iptables); err != nil {
 		klog.ErrorS(err, "Failed to ensure iptables")
@@ -415,9 +409,9 @@ func (proxier *Proxier) syncProxyRules() {
 
 	klog.V(4).InfoS("userspace proxy: processing service events", "count", len(changes))
 	for _, entry := range orderedServiceChanges(changes) {
-		existingPorts := servicePortNames(entry.change.current)
+		existingPorts := proxier.currentServicePortNames(entry.change.current)
 		proxier.unmergeService(entry.change.previous, existingPorts)
-		proxier.mergeService(entry.change.current)
+		proxier.mergeService(entry.change.current, existingPorts)
 	}
 	proxier.cleanupOrphanedServices()
 
@@ -476,12 +470,6 @@ func (proxier *Proxier) SetServiceExistsHandler(handler ServiceExistsFunc) {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	proxier.serviceExists = handler
-}
-
-func (proxier *Proxier) SetValidationReadyHandler(handler ValidationReadyFunc) {
-	proxier.mu.Lock()
-	defer proxier.mu.Unlock()
-	proxier.validationReady = handler
 }
 
 // addServiceOnPortInternal starts listening for a new service, returning the ServiceInfo.
@@ -578,6 +566,27 @@ func servicePortNames(service *v1.Service) sets.String {
 	return existingPorts
 }
 
+func (proxier *Proxier) currentServicePortNames(service *v1.Service) sets.String {
+	if service == nil || utilproxy.ShouldSkipService(service) {
+		return nil
+	}
+
+	existingPorts := sets.NewString()
+	for i := range service.Spec.Ports {
+		servicePort := &service.Spec.Ports[i]
+		serviceName := proxy.ServicePortName{
+			NamespacedName: types.NamespacedName{Namespace: service.Namespace, Name: service.Name},
+			Port:           servicePort.Name,
+		}
+		if proxier.serviceStillExists(serviceName) {
+			existingPorts.Insert(servicePort.Name)
+		} else {
+			klog.InfoS("Skipping stale service port from current state", "servicePortName", serviceName)
+		}
+	}
+	return existingPorts
+}
+
 func (proxier *Proxier) serviceStillExists(serviceName proxy.ServicePortName) bool {
 	if proxier.namespaceExists != nil && !proxier.namespaceExists(serviceName.NamespacedName.Namespace) {
 		return false
@@ -614,17 +623,22 @@ func (proxier *Proxier) cleanupOrphanedServices() {
 	}
 }
 
-func (proxier *Proxier) mergeService(service *v1.Service) sets.String {
+func (proxier *Proxier) mergeService(service *v1.Service, existingPorts sets.String) sets.String {
 	if service == nil {
 		return nil
 	}
 	if utilproxy.ShouldSkipService(service) {
 		return nil
 	}
-	existingPorts := servicePortNames(service)
+	if existingPorts == nil {
+		existingPorts = servicePortNames(service)
+	}
 	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
+		if !existingPorts.Has(servicePort.Name) {
+			continue
+		}
 		serviceName := proxy.ServicePortName{NamespacedName: svcName, Port: servicePort.Name}
 		info, exists := proxier.serviceMap[serviceName]
 		// TODO: check health of the socket? What if ProxyLoop exited?
