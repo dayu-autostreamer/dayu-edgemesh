@@ -154,7 +154,6 @@ func (s *Server) Run() error {
 	// only notify on changes, and the initial update (on process start) may be lost if no handlers
 	// are registered yet.
 	serviceInformer := informerFactory.Core().V1().Services()
-	namespaceInformer := namespaceInformerFactory.Core().V1().Namespaces()
 	validationServiceInformer := validationServiceInformerFactory.Core().V1().Services()
 	validationNamespaceInformer := validationNamespaceInformerFactory.Core().V1().Namespaces()
 	if userspaceProxier, ok := s.Proxier.(*userspace.Proxier); ok {
