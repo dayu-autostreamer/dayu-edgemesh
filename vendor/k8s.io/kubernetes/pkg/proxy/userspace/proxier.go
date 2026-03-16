@@ -134,6 +134,9 @@ type serviceChangeEntry struct {
 	change *serviceChange
 }
 
+type NamespaceExistsFunc func(namespace string) bool
+type ServiceExistsFunc func(service proxy.ServicePortName) bool
+
 // Interface for async runner; abstracted for testing
 type asyncRunnerInterface interface {
 	Run()
@@ -163,6 +166,8 @@ type Proxier struct {
 	proxyPorts      PortAllocator
 	makeProxySocket ProxySocketFunc
 	exec            utilexec.Interface
+	namespaceExists NamespaceExistsFunc
+	serviceExists   ServiceExistsFunc
 	// endpointsSynced and servicesSynced are set to 1 when the corresponding
 	// objects are synced after startup. This is used to avoid updating iptables
 	// with some partial data after kube-proxy restart.
@@ -408,6 +413,7 @@ func (proxier *Proxier) syncProxyRules() {
 		proxier.unmergeService(entry.change.previous, existingPorts)
 		proxier.mergeService(entry.change.current)
 	}
+	proxier.cleanupOrphanedServices()
 
 	proxier.localAddrs = utilproxy.GetLocalAddrSet()
 
@@ -452,6 +458,18 @@ func (proxier *Proxier) getServiceInfo(service proxy.ServicePortName) (*ServiceI
 	defer proxier.mu.Unlock()
 	info, ok := proxier.serviceMap[service]
 	return info, ok
+}
+
+func (proxier *Proxier) SetNamespaceExistsHandler(handler NamespaceExistsFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.namespaceExists = handler
+}
+
+func (proxier *Proxier) SetServiceExistsHandler(handler ServiceExistsFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.serviceExists = handler
 }
 
 // addServiceOnPortInternal starts listening for a new service, returning the ServiceInfo.
@@ -546,6 +564,42 @@ func servicePortNames(service *v1.Service) sets.String {
 		existingPorts.Insert(service.Spec.Ports[i].Name)
 	}
 	return existingPorts
+}
+
+func (proxier *Proxier) serviceStillExists(serviceName proxy.ServicePortName) bool {
+	if proxier.namespaceExists != nil && !proxier.namespaceExists(serviceName.NamespacedName.Namespace) {
+		return false
+	}
+	if proxier.serviceExists != nil && !proxier.serviceExists(serviceName) {
+		return false
+	}
+	return true
+}
+
+func (proxier *Proxier) cleanupOrphanedServices() {
+	staleUDPServices := sets.NewString()
+	for serviceName, info := range proxier.serviceMap {
+		if proxier.serviceStillExists(serviceName) {
+			continue
+		}
+
+		klog.InfoS("Cleaning up orphaned service from proxier state", "servicePortName", serviceName)
+		if info.protocol == v1.ProtocolUDP {
+			staleUDPServices.Insert(info.portal.ip.String())
+		}
+
+		if err := proxier.cleanupPortalAndProxy(serviceName, info); err != nil {
+			klog.ErrorS(err, "Failed to cleanup orphaned service")
+		}
+		proxier.loadBalancer.DeleteService(serviceName)
+		info.setFinished()
+	}
+
+	for _, svcIP := range staleUDPServices.UnsortedList() {
+		if err := conntrack.ClearEntriesForIP(proxier.exec, svcIP, v1.ProtocolUDP); err != nil {
+			klog.ErrorS(err, "Failed to delete stale orphaned service IP connections", "ip", svcIP)
+		}
+	}
 }
 
 func (proxier *Proxier) mergeService(service *v1.Service) sets.String {

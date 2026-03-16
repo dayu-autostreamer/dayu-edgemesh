@@ -128,11 +128,38 @@ func (s *Server) Run() error {
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
 			options.LabelSelector = labelSelector.String()
 		}))
+	namespaceInformerFactory := informers.NewSharedInformerFactory(s.kubeClient, s.ConfigSyncPeriod)
 	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
 	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
 	// only notify on changes, and the initial update (on process start) may be lost if no handlers
 	// are registered yet.
-	serviceConfig := config.NewServiceConfig(informerFactory.Core().V1().Services(), s.ConfigSyncPeriod)
+	serviceInformer := informerFactory.Core().V1().Services()
+	namespaceInformer := namespaceInformerFactory.Core().V1().Namespaces()
+	if userspaceProxier, ok := s.Proxier.(*userspace.Proxier); ok {
+		userspaceProxier.SetNamespaceExistsHandler(func(namespace string) bool {
+			if !namespaceInformer.Informer().HasSynced() {
+				return true
+			}
+			_, err := namespaceInformer.Lister().Get(namespace)
+			return err == nil
+		})
+		userspaceProxier.SetServiceExistsHandler(func(servicePort proxy.ServicePortName) bool {
+			if !serviceInformer.Informer().HasSynced() {
+				return true
+			}
+			service, err := serviceInformer.Lister().Services(servicePort.NamespacedName.Namespace).Get(servicePort.NamespacedName.Name)
+			if err != nil {
+				return false
+			}
+			for i := range service.Spec.Ports {
+				if service.Spec.Ports[i].Name == servicePort.Port {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	serviceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
 	serviceConfig.RegisterEventHandler(s.Proxier)
 	go serviceConfig.Run(wait.NeverStop)
 
@@ -145,6 +172,7 @@ func (s *Server) Run() error {
 	// This has to start after the calls to NewServiceConfig and NewEndpointsConfig because those
 	// functions must configure their shared informer event handlers first.
 	informerFactory.Start(wait.NeverStop)
+	namespaceInformerFactory.Start(wait.NeverStop)
 
 	// Run loadBalancer
 	s.loadBalancer.Config.Caller = defaults.ProxyCaller
