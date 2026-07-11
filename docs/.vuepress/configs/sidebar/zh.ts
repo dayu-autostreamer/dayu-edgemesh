@@ -18,6 +18,7 @@ const reference = {
   text: '参考',
   children: [
     '/zh/reference/config-items.md',
+    '/zh/managed-runtime.md',
   ],
 }
 

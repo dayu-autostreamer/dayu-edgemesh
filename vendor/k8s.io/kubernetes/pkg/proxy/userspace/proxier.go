@@ -17,6 +17,7 @@ limitations under the License.
 package userspace
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -70,6 +71,13 @@ type ServiceInfo struct {
 	loadBalancerStatus  v1.LoadBalancerStatus
 	sessionAffinityType v1.ServiceAffinity
 	stickyMaxAgeSeconds int
+	serviceUID          types.UID
+	managed             bool
+	teardownPending     bool
+	portalClosed        bool
+	socketClosed        bool
+	proxyPortReleased   bool
+	removeLoadBalancer  bool
 	// Deprecated, but required for back-compat (including e2e)
 	externalIPs []string
 
@@ -136,6 +144,10 @@ type serviceChangeEntry struct {
 
 type NamespaceExistsFunc func(namespace string) bool
 type ServiceExistsFunc func(service proxy.ServicePortName) bool
+type ManagedServiceFunc func(service *v1.Service) bool
+type ServicePendingFunc func(service proxy.ServicePortName, serviceUID types.UID)
+type ServiceAppliedFunc func(service proxy.ServicePortName, serviceUID types.UID, applied bool)
+type ServiceRemovedFunc func(service proxy.ServicePortName, serviceUID types.UID)
 
 // Interface for async runner; abstracted for testing
 type asyncRunnerInterface interface {
@@ -168,6 +180,10 @@ type Proxier struct {
 	exec            utilexec.Interface
 	namespaceExists NamespaceExistsFunc
 	serviceExists   ServiceExistsFunc
+	managedService  ManagedServiceFunc
+	servicePending  ServicePendingFunc
+	serviceApplied  ServiceAppliedFunc
+	serviceRemoved  ServiceRemovedFunc
 	// endpointsSynced and servicesSynced are set to 1 when the corresponding
 	// objects are synced after startup. This is used to avoid updating iptables
 	// with some partial data after kube-proxy restart.
@@ -177,7 +193,8 @@ type Proxier struct {
 	// protects serviceChanges
 	serviceChangesLock sync.Mutex
 	serviceChanges     map[types.NamespacedName]*serviceChange // map of service changes
-	syncRunner         asyncRunnerInterface                    // governs calls to syncProxyRules
+	desiredServices    map[types.NamespacedName]*v1.Service
+	syncRunner         asyncRunnerInterface // governs calls to syncProxyRules
 
 	stopChan chan struct{}
 }
@@ -276,6 +293,7 @@ func createProxier(loadBalancer LoadBalancer, listenIP net.IP, iptables iptables
 		loadBalancer:    loadBalancer,
 		serviceMap:      make(map[proxy.ServicePortName]*ServiceInfo),
 		serviceChanges:  make(map[types.NamespacedName]*serviceChange),
+		desiredServices: make(map[types.NamespacedName]*v1.Service),
 		portMap:         make(map[portMapKey]*portMapValue),
 		syncPeriod:      syncPeriod,
 		minSyncPeriod:   minSyncPeriod,
@@ -430,6 +448,9 @@ func (proxier *Proxier) SyncLoop() {
 func (proxier *Proxier) ensurePortals() {
 	// NB: This does not remove rules that should not be present.
 	for name, info := range proxier.serviceMap {
+		if info.teardownPending {
+			continue
+		}
 		err := proxier.openPortal(name, info)
 		if err != nil {
 			klog.ErrorS(err, "Failed to ensure portal", "servicePortName", name)
@@ -445,12 +466,22 @@ func (proxier *Proxier) cleanupStaleStickySessions() {
 }
 
 func (proxier *Proxier) stopProxy(service proxy.ServicePortName, info *ServiceInfo) error {
-	delete(proxier.serviceMap, service)
 	info.setAlive(false)
-	err := info.socket.Close()
-	port := info.socket.ListenPort()
-	proxier.proxyPorts.Release(port)
-	return err
+	if !info.socketClosed {
+		if err := info.socket.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !isClosedError(err) {
+			return err
+		}
+		info.socketClosed = true
+	}
+	if current, exists := proxier.serviceMap[service]; exists && current == info {
+		delete(proxier.serviceMap, service)
+	}
+	if !info.proxyPortReleased {
+		port := info.socket.ListenPort()
+		proxier.proxyPorts.Release(port)
+		info.proxyPortReleased = true
+	}
+	return nil
 }
 
 func (proxier *Proxier) getServiceInfo(service proxy.ServicePortName) (*ServiceInfo, bool) {
@@ -470,6 +501,41 @@ func (proxier *Proxier) SetServiceExistsHandler(handler ServiceExistsFunc) {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	proxier.serviceExists = handler
+}
+
+// SetManagedServiceHandler identifies the opt-in data path directly from the
+// Service event, avoiding cross-handler ordering dependencies.
+func (proxier *Proxier) SetManagedServiceHandler(handler ManagedServiceFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.managedService = handler
+}
+
+// SetServicePendingHandler reports a managed Service before its portal is
+// opened, allowing consumers to fail closed without depending on informer
+// handler ordering.
+func (proxier *Proxier) SetServicePendingHandler(handler ServicePendingFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.servicePending = handler
+}
+
+// SetServiceAppliedHandler reports the real portal lifecycle for managed
+// Services. applied=true is emitted only after portal and load-balancer setup.
+func (proxier *Proxier) SetServiceAppliedHandler(handler ServiceAppliedFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.serviceApplied = handler
+}
+
+// SetServiceRemovedHandler reports that the exact Service incarnation no
+// longer owns a portal or proxy socket. A final deletion also removes the
+// shared legacy load-balancer state; a same-port replacement preserves its
+// endpoint cache so legacy traffic does not wait for another Endpoints event.
+func (proxier *Proxier) SetServiceRemovedHandler(handler ServiceRemovedFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.serviceRemoved = handler
 }
 
 // addServiceOnPortInternal starts listening for a new service, returning the ServiceInfo.
@@ -510,13 +576,28 @@ func (proxier *Proxier) addServiceOnPortInternal(service proxy.ServicePortName, 
 	return si, nil
 }
 
-func (proxier *Proxier) cleanupPortalAndProxy(serviceName proxy.ServicePortName, info *ServiceInfo) error {
-	if err := proxier.closePortal(serviceName, info); err != nil {
-		return fmt.Errorf("failed to close portal for %q: %w", serviceName, err)
+func (proxier *Proxier) cleanupPortalAndProxy(serviceName proxy.ServicePortName, info *ServiceInfo, removeLoadBalancer bool) error {
+	proxier.notifyServiceApplied(serviceName, info, false)
+	info.teardownPending = true
+	info.removeLoadBalancer = info.removeLoadBalancer || removeLoadBalancer
+	if !info.portalClosed {
+		if err := proxier.closePortal(serviceName, info); err != nil {
+			return fmt.Errorf("failed to close portal for %q: %w", serviceName, err)
+		}
+		info.portalClosed = true
 	}
 	if err := proxier.stopProxy(serviceName, info); err != nil {
 		return fmt.Errorf("failed to stop service %q: %w", serviceName, err)
 	}
+	if info.removeLoadBalancer {
+		// A final teardown request can outlive the Service incarnation that
+		// created it. Re-check the latest desired state at the commit point so
+		// a same-name/same-port replacement does not lose an Endpoints update
+		// that arrived while teardown was being retried.
+		proxier.deleteLoadBalancerServiceIfUndesired(serviceName)
+	}
+	info.teardownPending = false
+	proxier.notifyServiceRemoved(serviceName, info)
 	return nil
 }
 
@@ -572,13 +653,14 @@ func (proxier *Proxier) currentServicePortNames(service *v1.Service) sets.String
 	}
 
 	existingPorts := sets.NewString()
+	managed := proxier.managedService != nil && proxier.managedService(service)
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
 		serviceName := proxy.ServicePortName{
 			NamespacedName: types.NamespacedName{Namespace: service.Namespace, Name: service.Name},
 			Port:           servicePort.Name,
 		}
-		if proxier.serviceStillExists(serviceName) {
+		if managed || proxier.serviceStillExists(serviceName) {
 			existingPorts.Insert(servicePort.Name)
 		} else {
 			klog.InfoS("Skipping stale service port from current state", "servicePortName", serviceName)
@@ -600,7 +682,17 @@ func (proxier *Proxier) serviceStillExists(serviceName proxy.ServicePortName) bo
 func (proxier *Proxier) cleanupOrphanedServices() {
 	staleUDPServices := sets.NewString()
 	for serviceName, info := range proxier.serviceMap {
-		if proxier.serviceStillExists(serviceName) {
+		if info.teardownPending {
+			removeLoadBalancer := info.removeLoadBalancer || !proxier.desiredServicePortExists(serviceName)
+			if err := proxier.cleanupPortalAndProxy(serviceName, info, removeLoadBalancer); err != nil {
+				klog.ErrorS(err, "Failed to retry portal and proxy teardown", "servicePortName", serviceName)
+				proxier.scheduleSyncRetry()
+				continue
+			}
+			info.setFinished()
+			continue
+		}
+		if info.managed || proxier.serviceStillExists(serviceName) {
 			continue
 		}
 
@@ -609,10 +701,11 @@ func (proxier *Proxier) cleanupOrphanedServices() {
 			staleUDPServices.Insert(info.portal.ip.String())
 		}
 
-		if err := proxier.cleanupPortalAndProxy(serviceName, info); err != nil {
+		if err := proxier.cleanupPortalAndProxy(serviceName, info, true); err != nil {
 			klog.ErrorS(err, "Failed to cleanup orphaned service")
+			proxier.scheduleSyncRetry()
+			continue
 		}
-		proxier.loadBalancer.DeleteService(serviceName)
 		info.setFinished()
 	}
 
@@ -634,6 +727,7 @@ func (proxier *Proxier) mergeService(service *v1.Service, existingPorts sets.Str
 		existingPorts = servicePortNames(service)
 	}
 	svcName := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	managed := proxier.managedService != nil && proxier.managedService(service)
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
 		if !existingPorts.Has(servicePort.Name) {
@@ -642,20 +736,23 @@ func (proxier *Proxier) mergeService(service *v1.Service, existingPorts sets.Str
 		serviceName := proxy.ServicePortName{NamespacedName: svcName, Port: servicePort.Name}
 		info, exists := proxier.serviceMap[serviceName]
 		// TODO: check health of the socket? What if ProxyLoop exited?
-		if exists && sameConfig(info, service, servicePort) {
+		if exists && sameConfig(info, service, servicePort, managed) {
 			// Nothing changed.
 			continue
 		}
 		if exists {
 			klog.V(4).InfoS("Something changed for service: stopping it", "serviceName", serviceName)
-			if err := proxier.cleanupPortalAndProxy(serviceName, info); err != nil {
+			if err := proxier.cleanupPortalAndProxy(serviceName, info, false); err != nil {
 				klog.ErrorS(err, "Failed to cleanup portal and proxy")
+				proxier.scheduleServiceRetry(service)
+				continue
 			}
 			info.setFinished()
 		}
 		proxyPort, err := proxier.proxyPorts.AllocateNext()
 		if err != nil {
 			klog.ErrorS(err, "Failed to allocate proxy port", "serviceName", serviceName)
+			proxier.scheduleServiceRetry(service)
 			continue
 		}
 
@@ -664,6 +761,8 @@ func (proxier *Proxier) mergeService(service *v1.Service, existingPorts sets.Str
 		info, err = proxier.addServiceOnPortInternal(serviceName, servicePort.Protocol, proxyPort, proxier.udpIdleTimeout)
 		if err != nil {
 			klog.ErrorS(err, "Failed to start proxy", "serviceName", serviceName)
+			proxier.proxyPorts.Release(proxyPort)
+			proxier.scheduleServiceRetry(service)
 			continue
 		}
 		info.portal.ip = serviceIP
@@ -672,6 +771,8 @@ func (proxier *Proxier) mergeService(service *v1.Service, existingPorts sets.Str
 		// Deep-copy in case the service instance changes
 		info.loadBalancerStatus = *service.Status.LoadBalancer.DeepCopy()
 		info.nodePort = int(servicePort.NodePort)
+		info.serviceUID = service.UID
+		info.managed = managed
 		info.sessionAffinityType = service.Spec.SessionAffinity
 		// Kube-apiserver side guarantees SessionAffinityConfig won't be nil when session affinity type is ClientIP
 		if service.Spec.SessionAffinity == v1.ServiceAffinityClientIP {
@@ -679,13 +780,23 @@ func (proxier *Proxier) mergeService(service *v1.Service, existingPorts sets.Str
 		}
 
 		klog.V(4).InfoS("Record serviceInfo", "serviceInfo", info)
+		proxier.notifyServicePending(serviceName, info)
 
 		if err := proxier.openPortal(serviceName, info); err != nil {
 			klog.ErrorS(err, "Failed to open portal", "serviceName", serviceName)
+			_ = proxier.cleanupPortalAndProxy(serviceName, info, false)
+			proxier.scheduleServiceRetry(service)
+			continue
 		}
-		proxier.loadBalancer.NewService(serviceName, info.sessionAffinityType, info.stickyMaxAgeSeconds)
+		if err := proxier.loadBalancer.NewService(serviceName, info.sessionAffinityType, info.stickyMaxAgeSeconds); err != nil {
+			klog.ErrorS(err, "Failed to register service with load balancer", "serviceName", serviceName)
+			_ = proxier.cleanupPortalAndProxy(serviceName, info, false)
+			proxier.scheduleServiceRetry(service)
+			continue
+		}
 
 		info.setStarted()
+		proxier.notifyServiceApplied(serviceName, info, true)
 	}
 
 	return existingPorts
@@ -711,7 +822,10 @@ func (proxier *Proxier) unmergeService(service *v1.Service, existingPorts sets.S
 		klog.V(1).InfoS("Stopping service", "serviceName", serviceName)
 		info, exists := proxier.serviceMap[serviceName]
 		if !exists {
-			klog.ErrorS(nil, "Service is being removed but doesn't exist", "serviceName", serviceName)
+			// Setup or replacement teardown may already have removed the proxy
+			// socket. Clear independently learned endpoint state only if a newer
+			// desired Service has not already reclaimed the same named port.
+			proxier.deleteLoadBalancerServiceIfUndesired(serviceName)
 			continue
 		}
 
@@ -719,10 +833,11 @@ func (proxier *Proxier) unmergeService(service *v1.Service, existingPorts sets.S
 			staleUDPServices.Insert(proxier.serviceMap[serviceName].portal.ip.String())
 		}
 
-		if err := proxier.cleanupPortalAndProxy(serviceName, info); err != nil {
+		if err := proxier.cleanupPortalAndProxy(serviceName, info, true); err != nil {
 			klog.ErrorS(err, "Clean up portal and proxy")
+			proxier.scheduleSyncRetry()
+			continue
 		}
-		proxier.loadBalancer.DeleteService(serviceName)
 		info.setFinished()
 	}
 	for _, svcIP := range staleUDPServices.UnsortedList() {
@@ -743,6 +858,11 @@ func (proxier *Proxier) serviceChange(previous, current *v1.Service, detail stri
 
 	proxier.serviceChangesLock.Lock()
 	defer proxier.serviceChangesLock.Unlock()
+	if current == nil {
+		delete(proxier.desiredServices, svcName)
+	} else {
+		proxier.desiredServices[svcName] = current.DeepCopy()
+	}
 
 	change, exists := proxier.serviceChanges[svcName]
 	if !exists {
@@ -762,6 +882,62 @@ func (proxier *Proxier) serviceChange(previous, current *v1.Service, detail stri
 		delete(proxier.serviceChanges, svcName)
 	} else if proxier.isInitialized() {
 		// change will have an effect, ask the proxy to sync
+		proxier.syncRunner.Run()
+	}
+}
+
+// scheduleServiceRetry merges only the latest desired Service incarnation back
+// into the normal change set. The existing bounded-frequency sync runner owns
+// coalescing and rate limiting; no second timer state machine is needed.
+func (proxier *Proxier) scheduleServiceRetry(service *v1.Service) {
+	if service == nil || proxier.syncRunner == nil {
+		return
+	}
+	name := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+	proxier.serviceChangesLock.Lock()
+	desired := proxier.desiredServices[name]
+	if desired == nil || desired.UID != service.UID {
+		proxier.serviceChangesLock.Unlock()
+		return
+	}
+	change := proxier.serviceChanges[name]
+	if change == nil {
+		// Preserve a previous object so a delete arriving before this retry is
+		// processed cannot collapse nil -> nil and lose final teardown.
+		change = &serviceChange{previous: desired.DeepCopy()}
+		proxier.serviceChanges[name] = change
+	}
+	change.current = desired.DeepCopy()
+	proxier.serviceChangesLock.Unlock()
+	proxier.syncRunner.Run()
+}
+
+func (proxier *Proxier) desiredServicePortExists(serviceName proxy.ServicePortName) bool {
+	proxier.serviceChangesLock.Lock()
+	defer proxier.serviceChangesLock.Unlock()
+	return proxier.desiredServicePortExistsLocked(serviceName)
+}
+
+func (proxier *Proxier) desiredServicePortExistsLocked(serviceName proxy.ServicePortName) bool {
+	desired := proxier.desiredServices[serviceName.NamespacedName]
+	return servicePortNames(desired).Has(serviceName.Port)
+}
+
+// deleteLoadBalancerServiceIfUndesired serializes the final delete with
+// Service desired-state updates. Endpoints and Service informers are
+// independent, so deleting solely from an old teardown flag could otherwise
+// erase endpoint state already published for a replacement Service.
+func (proxier *Proxier) deleteLoadBalancerServiceIfUndesired(serviceName proxy.ServicePortName) {
+	proxier.serviceChangesLock.Lock()
+	defer proxier.serviceChangesLock.Unlock()
+	if proxier.desiredServicePortExistsLocked(serviceName) {
+		return
+	}
+	proxier.loadBalancer.DeleteService(serviceName)
+}
+
+func (proxier *Proxier) scheduleSyncRetry() {
+	if proxier.syncRunner != nil {
 		proxier.syncRunner.Run()
 	}
 }
@@ -839,7 +1015,10 @@ func (proxier *Proxier) OnEndpointsSynced() {
 	go proxier.syncProxyRules()
 }
 
-func sameConfig(info *ServiceInfo, service *v1.Service, port *v1.ServicePort) bool {
+func sameConfig(info *ServiceInfo, service *v1.Service, port *v1.ServicePort, managed bool) bool {
+	if info.teardownPending || info.serviceUID != service.UID || info.managed != managed {
+		return false
+	}
 	if info.protocol != port.Protocol || info.portal.port != int(port.Port) || info.nodePort != int(port.NodePort) {
 		return false
 	}
@@ -856,6 +1035,27 @@ func sameConfig(info *ServiceInfo, service *v1.Service, port *v1.ServicePort) bo
 		return false
 	}
 	return true
+}
+
+func (proxier *Proxier) notifyServicePending(service proxy.ServicePortName, info *ServiceInfo) {
+	if info == nil || !info.managed || proxier.servicePending == nil {
+		return
+	}
+	proxier.servicePending(service, info.serviceUID)
+}
+
+func (proxier *Proxier) notifyServiceApplied(service proxy.ServicePortName, info *ServiceInfo, applied bool) {
+	if info == nil || !info.managed || proxier.serviceApplied == nil {
+		return
+	}
+	proxier.serviceApplied(service, info.serviceUID, applied)
+}
+
+func (proxier *Proxier) notifyServiceRemoved(service proxy.ServicePortName, info *ServiceInfo) {
+	if info == nil || !info.managed || proxier.serviceRemoved == nil {
+		return
+	}
+	proxier.serviceRemoved(service, info.serviceUID)
 }
 
 func ipsEqual(lhs, rhs []string) bool {

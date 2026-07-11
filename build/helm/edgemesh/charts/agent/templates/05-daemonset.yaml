@@ -31,7 +31,7 @@ spec:
         - name: {{ .Release.Name }}-agent
           securityContext:
             privileged: true
-          image: {{ .Values.image }}
+          image: {{ if .Values.modules.edgeProxy.managedRuntime.enable }}{{ required "agent.modules.edgeProxy.managedRuntime.image is required when managedRuntime is enabled" .Values.modules.edgeProxy.managedRuntime.image }}{{ else }}{{ .Values.image }}{{ end }}
           env:
             - name: NODE_NAME
               valueFrom:

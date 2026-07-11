@@ -39,17 +39,22 @@ func ValidateKubeAPIConfig(c *v1alpha1.KubeAPIConfig) field.ErrorList {
 }
 
 func ValidateModuleEdgeProxy(c *v1alpha1.EdgeProxyConfig) field.ErrorList {
+	if c.ManagedRuntime != nil && c.ManagedRuntime.Enable && !c.Enable {
+		return field.ErrorList{field.Invalid(field.NewPath("managedRuntime", "enable"), true, "managedRuntime requires edgeProxy.enable=true")}
+	}
 	if !c.Enable {
 		return field.ErrorList{}
 	}
 
 	allErrs := field.ErrorList{}
+	if c.ManagedRuntime != nil && c.ManagedRuntime.Enable && c.ServiceFilterMode != defaults.FilterIfLabelExistsMode {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("serviceFilterMode"), c.ServiceFilterMode, "managedRuntime requires FilterIfLabelExists so RuntimeServices share the primary informer"))
+	}
 
 	validServiceFilterModes := []defaults.ServiceFilterMode{"FilterIfLabelDoesNotExists", "FilterIfLabelExists"}
 	if !isValidServiceFilterMode(c.ServiceFilterMode, validServiceFilterModes) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("serviceFilterMode"), c.ServiceFilterMode, "invalid serviceFilterMode"))
 	}
-
 	return allErrs
 }
 

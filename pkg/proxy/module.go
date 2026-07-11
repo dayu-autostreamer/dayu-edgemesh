@@ -9,6 +9,7 @@ import (
 	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
 	"github.com/kubeedge/edgemesh/pkg/clients"
+	"github.com/kubeedge/edgemesh/pkg/meshstate"
 	netutil "github.com/kubeedge/edgemesh/pkg/util/net"
 )
 
@@ -41,6 +42,14 @@ func (proxy *EdgeProxy) Start() {
 
 // Shutdown edgeproxy
 func (proxy *EdgeProxy) Shutdown() {
+	if proxy.ProxyServer == nil {
+		return
+	}
+	if proxy.ProxyServer.managedRuntime != nil {
+		if err := proxy.ProxyServer.managedRuntime.Close(); err != nil {
+			klog.ErrorS(err, "Close managed runtime status server")
+		}
+	}
 	err := proxy.ProxyServer.CleanupAndExit()
 	if err != nil {
 		klog.ErrorS(err, "Cleanup iptables failed")
@@ -61,7 +70,10 @@ func newEdgeProxy(c *v1alpha1.EdgeProxyConfig, cli *clients.Clients) (*EdgeProxy
 	if !c.Enable {
 		return &EdgeProxy{Config: c}, nil
 	}
-
+	managedRuntime, err := meshstate.NewRuntime(c.ManagedRuntime)
+	if err != nil {
+		return nil, fmt.Errorf("initialize managed runtime: %w", err)
+	}
 	// get proxy listen ip
 	listenIP, err := netutil.GetInterfaceIP(c.ListenInterface)
 	if err != nil {
@@ -69,7 +81,7 @@ func newEdgeProxy(c *v1alpha1.EdgeProxyConfig, cli *clients.Clients) (*EdgeProxy
 	}
 
 	// new proxy server
-	proxyServer, err := newProxyServer(NewDefaultKubeProxyConfiguration(listenIP.String()), c.LoadBalancer, cli.GetKubeClient(), cli.GetIstioClient(), c.ServiceFilterMode)
+	proxyServer, err := newProxyServer(NewDefaultKubeProxyConfiguration(listenIP.String()), c.LoadBalancer, cli.GetKubeClient(), cli.GetIstioClient(), c.ServiceFilterMode, managedRuntime)
 	if err != nil {
 		return nil, fmt.Errorf("new proxy server err: %v", err)
 	}

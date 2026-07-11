@@ -99,6 +99,10 @@ data:
         {{- if .Values.modules.edgeProxy.serviceFilterMode }}
         serviceFilterMode: {{ .Values.modules.edgeProxy.serviceFilterMode }}
         {{- end }}
+        {{- if .Values.modules.edgeProxy.managedRuntime }}
+        managedRuntime:
+          enable: {{ .Values.modules.edgeProxy.managedRuntime.enable | default false }}
+        {{- end }}
         {{- if .Values.modules.edgeProxy.socks5Proxy }}
         socks5Proxy:
           {{- if .Values.modules.edgeProxy.socks5Proxy.enable }}
@@ -122,9 +126,6 @@ data:
             load: {{ .Values.modules.edgeProxy.loadBalancer.consistentHash.load }}
             {{- end }}
           {{- end }}
-        {{- end }}
-        {{- if .Values.modules.edgeProxy.serviceFilterMode }}
-        serviceFilterMode: {{ .Values.modules.edgeProxy.serviceFilterMode }}
         {{- end }}
       {{- end }}
       {{- if .Values.modules.edgeTunnel }}

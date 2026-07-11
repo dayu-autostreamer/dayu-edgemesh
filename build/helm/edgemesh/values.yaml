@@ -31,6 +31,13 @@ agent:
   modules:
     edgeProxy:
       enable: true
+      # Disabled by default for backward compatibility with the legacy
+      # JointMultiEdgeService/NodePort path.
+      managedRuntime:
+        enable: false
+        # Required when enable=true. Use an immutable edgemesh-agent image
+        # built from the same source revision as this chart.
+        image: ""
     edgeTunnel:
       enable: true
     edgeCNI:

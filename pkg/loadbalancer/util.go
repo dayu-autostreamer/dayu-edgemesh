@@ -18,22 +18,21 @@ import (
 	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 )
 
-const (
-	nodeIndex = iota
-	podIndex
-	ipIndex
-	portIndex
-	endpointLen
-)
-
 // parseEndpoint parse an endpoint like "nodeName:podName:ip:port" style strings
 func parseEndpoint(endpoint string) (string, string, string, string, bool) {
-	info := strings.Split(endpoint, ":")
-	if len(info) != endpointLen {
+	identity := strings.SplitN(endpoint, ":", 3)
+	if len(identity) != 3 {
 		return "", "", "", "", false
 	}
-	// TODO check IP and port
-	return info[nodeIndex], info[podIndex], info[ipIndex], info[portIndex], true
+	host, port, err := net.SplitHostPort(identity[2])
+	if err != nil || net.ParseIP(host) == nil {
+		return "", "", "", "", false
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", "", "", "", false
+	}
+	return identity[0], identity[1], host, port, true
 }
 
 // isValidEndpoint checks that the given host / port pair are valid endpoint

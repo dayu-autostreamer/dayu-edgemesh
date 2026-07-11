@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/types"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -36,6 +37,7 @@ import (
 	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
 	"github.com/kubeedge/edgemesh/pkg/loadbalancer"
+	"github.com/kubeedge/edgemesh/pkg/meshstate"
 	kubeedgeconstants "github.com/kubeedge/kubeedge/common/constants"
 )
 
@@ -57,6 +59,7 @@ type Server struct {
 	ConfigSyncPeriod  time.Duration
 	loadBalancer      *loadbalancer.LoadBalancer
 	serviceFilterMode defaults.ServiceFilterMode
+	managedRuntime    *meshstate.Runtime
 }
 
 // NewDefaultKubeProxyConfiguration new default kube-proxy config for edgemesh-agent runtime.
@@ -80,7 +83,8 @@ func newProxyServer(
 	lbConfig *v1alpha1.LoadBalancer,
 	client clientset.Interface,
 	istioClient istioclientset.Interface,
-	serviceFilterMode defaults.ServiceFilterMode) (*Server, error) {
+	serviceFilterMode defaults.ServiceFilterMode,
+	managedRuntime *meshstate.Runtime) (*Server, error) {
 	klog.V(0).Info("Using userspace Proxier.")
 
 	// Create a iptables utils.
@@ -89,6 +93,9 @@ func newProxyServer(
 
 	// Initialize a loadBalancer
 	loadBalancer := loadbalancer.New(lbConfig, client, istioClient, config.ConfigSyncPeriod.Duration)
+	if managedRuntime != nil {
+		loadBalancer.SetManagedRuntimeStore(managedRuntime.Store)
+	}
 	initLoadBalancer(loadBalancer)
 
 	proxier, err := userspace.NewCustomProxier(
@@ -116,6 +123,7 @@ func newProxyServer(
 		ConfigSyncPeriod:  config.ConfigSyncPeriod.Duration,
 		loadBalancer:      loadBalancer,
 		serviceFilterMode: serviceFilterMode,
+		managedRuntime:    managedRuntime,
 	}, nil
 }
 
@@ -148,26 +156,45 @@ func (s *Server) Run() error {
 	validationServiceInformerFactory := informerFactory
 	validationNamespaceInformerFactory := namespaceInformerFactory
 	validationClient := s.kubeClient
-	if directValidationClient, source, err := buildValidationClient(s.kubeClient); err == nil {
-		validationClient = directValidationClient
-		validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
-			informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-				options.LabelSelector = labelSelector.String()
-			}))
-		validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
-		klog.InfoS("Using independent Kubernetes API validation source for EdgeMesh proxy state", "source", source)
+	if s.managedRuntime == nil {
+		if directValidationClient, source, err := buildValidationClient(s.kubeClient); err == nil {
+			validationClient = directValidationClient
+			validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
+				informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+					options.LabelSelector = labelSelector.String()
+				}))
+			validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
+			klog.InfoS("Using independent Kubernetes API validation source for EdgeMesh proxy state", "source", source)
+		} else {
+			klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", err)
+		}
 	} else {
-		klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", err)
+		klog.Info("Managed runtime enabled: reusing the primary MetaServer informer cache and disabling independent Kubernetes API validation")
 	}
 	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
 	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
 	// only notify on changes, and the initial update (on process start) may be lost if no handlers
 	// are registered yet.
 	serviceInformer := informerFactory.Core().V1().Services()
+	endpointsInformer := informerFactory.Core().V1().Endpoints()
 	validationServiceInformer := validationServiceInformerFactory.Core().V1().Services()
 	validationNamespaceInformer := validationNamespaceInformerFactory.Core().V1().Namespaces()
 	hasIndependentValidation := validationClient != s.kubeClient
 	if userspaceProxier, ok := s.Proxier.(*userspace.Proxier); ok {
+		if s.managedRuntime != nil {
+			userspaceProxier.SetManagedServiceHandler(func(service *v1.Service) bool {
+				return service != nil && service.Labels[meshstate.LabelMeshManaged] == "true"
+			})
+			userspaceProxier.SetServicePendingHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID) {
+				s.managedRuntime.Store.MarkPortalPending(serviceUID, servicePort)
+			})
+			userspaceProxier.SetServiceAppliedHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID, applied bool) {
+				s.managedRuntime.Store.MarkPortalApplied(serviceUID, servicePort, applied)
+			})
+			userspaceProxier.SetServiceRemovedHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID) {
+				s.managedRuntime.Store.MarkPortalRemoved(serviceUID, servicePort)
+			})
+		}
 		userspaceProxier.SetNamespaceExistsHandler(func(namespace string) bool {
 			if validationNamespaceInformer.Informer().HasSynced() {
 				_, err := validationNamespaceInformer.Lister().Get(namespace)
@@ -224,16 +251,23 @@ func (s *Server) Run() error {
 			return false
 		})
 	}
+	if s.managedRuntime != nil {
+		if err := s.managedRuntime.RegisterInformers(serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
+			return fmt.Errorf("register managed runtime informer handlers: %w", err)
+		}
+		if err := s.managedRuntime.StartStatusServer(); err != nil {
+			return fmt.Errorf("start managed runtime status server: %w", err)
+		}
+	}
 	serviceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
 	serviceConfig.RegisterEventHandler(s.Proxier)
 	go serviceConfig.Run(wait.NeverStop)
 
 	if endpointsHandler, ok := s.Proxier.(config.EndpointsHandler); ok {
-		endpointsConfig := config.NewEndpointsConfig(informerFactory.Core().V1().Endpoints(), s.ConfigSyncPeriod)
+		endpointsConfig := config.NewEndpointsConfig(endpointsInformer, s.ConfigSyncPeriod)
 		endpointsConfig.RegisterEventHandler(endpointsHandler)
 		go endpointsConfig.Run(wait.NeverStop)
 	}
-
 	// This has to start after the calls to NewServiceConfig and NewEndpointsConfig because those
 	// functions must configure their shared informer event handlers first.
 	informerFactory.Start(wait.NeverStop)
@@ -247,6 +281,11 @@ func (s *Server) Run() error {
 	s.loadBalancer.Config.Caller = defaults.ProxyCaller
 	err = s.loadBalancer.Run()
 	if err != nil {
+		if s.managedRuntime != nil {
+			if closeErr := s.managedRuntime.Close(); closeErr != nil {
+				klog.ErrorS(closeErr, "Close managed runtime status server after load balancer startup failure")
+			}
+		}
 		return fmt.Errorf("failed to run loadBalancer: %w", err)
 	}
 

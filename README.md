@@ -42,6 +42,73 @@ If direct validation is enabled successfully, `edgemesh-agent` will log:
 Using independent Kubernetes API validation source for EdgeMesh proxy state
 ```
 
+### Opt-in RuntimeService Data Path
+
+Dayu-Edgemesh now includes a revision-scoped data path for Sedna
+`RuntimeService` workloads. It replaces per-runtime Kubernetes discovery with
+one local, in-memory projection built from EdgeProxy's existing Service and
+Endpoints informers. No extra watch, polling loop, hosts file, or persistent
+cache is introduced on an edge node.
+
+This path is deliberately disabled by default:
+
+```yaml
+modules:
+  edgeProxy:
+    enable: true
+    serviceFilterMode: FilterIfLabelExists
+    managedRuntime:
+      enable: false
+```
+
+The Helm chart treats enablement as a managed install profile and requires an
+explicit agent image built from this source revision. This prevents a new
+ConfigMap from being paired silently with the default upstream binary:
+
+```sh
+helm upgrade --install edgemesh ./build/helm/edgemesh \
+  --namespace kubeedge \
+  --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
+  --set agent.modules.edgeProxy.managedRuntime.enable=true \
+  --set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1
+```
+
+Rendering fails if the gate is enabled without that image. Raw-manifest users
+must likewise replace the agent DaemonSet image before changing the gate.
+
+With `enable: false`, the existing `JointMultiEdgeService`/NodePort path and
+its independent stale-service validation remain unchanged. Enabling the gate
+adds exact routing only for ClusterIP Services labelled
+`dayu.io/mesh-managed=true`; unlabelled Services retain legacy proxy behavior.
+When the gate is enabled, both managed and legacy Services use the primary
+MetaServer-backed informer as their validation source, avoiding a second
+cloud API request path on edge nodes.
+
+A managed route becomes selectable only after all of the following agree on
+the same revision and Kubernetes object incarnation:
+
+- one valid Service and one ready Endpoints address are present;
+- the endpoint references the expected node and an exact Pod UID;
+- the userspace portal and load-balancer state have been applied; and
+- the primary informer caches have completed initial synchronization.
+
+The proxy reports a strict
+`PENDING -> APPLIED -> REMOVING -> REMOVED` portal lifecycle.
+`PENDING` is emitted before portal programming, so a proxier event that arrives
+before the projection's Service event is still marked managed and fails closed.
+`REMOVING` preserves that tombstone while the exact portal and socket are
+dismantled; only then is `REMOVED` emitted. Final deletion also removes legacy
+load-balancer state, while same-port replacement preserves its endpoint cache.
+Only the
+exact projection plus a synced source and `APPLIED` callback opens the route.
+
+Any missing or mismatched state fails closed instead of falling back to random
+legacy load balancing. The Sedna local controller can confirm a route through
+the loopback-only endpoint `GET http://127.0.0.1:10551/v1/routes/{serviceUID}`.
+See [Managed Runtime Architecture](docs/managed-runtime.md) and its
+[Chinese version](docs/zh/managed-runtime.md) for the resource contract,
+compatibility boundary, state model, status API, and rollout procedure.
+
 ## Quick Start
 
 clone repository

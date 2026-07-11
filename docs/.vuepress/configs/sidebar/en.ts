@@ -18,6 +18,7 @@ const reference = {
   text: 'Reference',
   children: [
     '/reference/config-items.md',
+    '/managed-runtime.md',
   ],
 }
 

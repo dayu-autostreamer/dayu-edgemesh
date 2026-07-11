@@ -2,15 +2,15 @@ package loadbalancer
 
 import (
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"math/rand"
 	"time"
-	"os"
 
 	istioapi "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	istio "istio.io/client-go/pkg/clientset/versioned"
@@ -33,6 +33,7 @@ import (
 
 	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
+	"github.com/kubeedge/edgemesh/pkg/meshstate"
 	"github.com/kubeedge/edgemesh/pkg/tunnel"
 	netutil "github.com/kubeedge/edgemesh/pkg/util/net"
 )
@@ -157,14 +158,15 @@ type LoadBalancer struct {
 	serviceChangesLock sync.Mutex
 	serviceChanges     map[types.NamespacedName]*serviceChange // map of service changes
 	syncRunner         asyncRunnerInterface                    // governs calls to syncProxyRules
+	managedRuntime     *meshstate.Store
 }
 
 func New(config *v1alpha1.LoadBalancer, kubeClient kubernetes.Interface, istioClient istio.Interface, syncPeriod time.Duration) *LoadBalancer {
 	hostname, err := os.Hostname()
-    if err != nil {
-        klog.Errorf("Failed to get hostname: %v", err)
-        hostname = ""
-    }
+	if err != nil {
+		klog.Errorf("Failed to get hostname: %v", err)
+		hostname = ""
+	}
 
 	lb := &LoadBalancer{
 		Config:         config,
@@ -180,6 +182,10 @@ func New(config *v1alpha1.LoadBalancer, kubeClient kubernetes.Interface, istioCl
 	}
 	lb.syncRunner = async.NewBoundedFrequencyRunner("sync-runner", lb.syncServices, time.Minute, syncPeriod, numBurstSyncs)
 	return lb
+}
+
+func (lb *LoadBalancer) SetManagedRuntimeStore(store *meshstate.Store) {
+	lb.managedRuntime = store
 }
 
 func (lb *LoadBalancer) isInitialized() bool {
@@ -811,7 +817,7 @@ func (lb *LoadBalancer) OnDestinationRuleSynced() {
 // setLoadBalancerPolicy new load-balance policy by policy name,
 // this assumes that lb.policyMapLock is already held.
 func (lb *LoadBalancer) setLoadBalancerPolicy(dr *istioapi.DestinationRule, policyName string, svcPort proxy.ServicePortName, endpoints []string) {
-    klog.Infof("[New no balance version] set loadbalancer policy: %s", policyName)
+	klog.Infof("[New no balance version] set loadbalancer policy: %s", policyName)
 	switch policyName {
 	case RoundRobin:
 		lb.policyMap[svcPort] = NewRoundRobinPolicy()
@@ -841,7 +847,7 @@ func (lb *LoadBalancer) tryPickEndpoint(svcPort proxy.ServicePortName, sessionAf
 		return "", cliReq, false
 	}
 
-    klog.Infof("[New no balance version] Using load balancing policy: %s", policy.Name())
+	klog.Infof("[New no balance version] Using load balancing policy: %s", policy.Name())
 
 	endpoint, req, err := policy.Pick(endpoints, srcAddr, netConn, cliReq)
 	if err != nil {
@@ -852,6 +858,15 @@ func (lb *LoadBalancer) tryPickEndpoint(svcPort proxy.ServicePortName, sessionAf
 
 func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcAddr net.Addr, sessionAffinityReset bool,
 	netConn net.Conn, cliReq *http.Request) (string, *http.Request, error) {
+	if lb.managedRuntime != nil {
+		endpoint, managed, applied := lb.managedRuntime.ManagedEndpoint(svcPort)
+		if managed {
+			if !applied {
+				return "", cliReq, fmt.Errorf("managed runtime route for %v is not applied", svcPort)
+			}
+			return endpoint, cliReq, nil
+		}
+	}
 	// Coarse locking is simple. We can get more fine-grained if/when we
 	// can prove it matters.
 	lb.lock.Lock()
@@ -876,9 +891,9 @@ func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcA
 	if picked {
 		return endpoint, req, nil
 	}
-    klog.Infof("policy not pick endpoint, continue..")
+	klog.Infof("policy not pick endpoint, continue..")
 
-    klog.Infof("[New no balance version] Current node hostname: %s",lb.hostname)
+	klog.Infof("[New no balance version] Current node hostname: %s", lb.hostname)
 	// Attempt to pick an endpoint based on the current node's hostname
 	var targetEndpoint string
 	for _, endpoint := range state.endpoints {
@@ -904,9 +919,9 @@ func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcA
 		if err != nil {
 			return "", req, fmt.Errorf("malformed source address %q: %v", srcAddr.String(), err)
 		}
-        klog.Infof("get ipaddr")
+		klog.Infof("get ipaddr")
 		if !sessionAffinityReset {
-		    klog.Infof("Enter [not sessionAffinityEnabled]")
+			klog.Infof("Enter [not sessionAffinityEnabled]")
 			sessionAffinity, exists := state.affinity.affinityMap[ipaddr]
 			klog.Infof("get sessionAffinity")
 			if exists && int(time.Since(sessionAffinity.lastUsed).Seconds()) < state.affinity.ttlSeconds {
@@ -921,9 +936,9 @@ func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcA
 		}
 	}
 	// Take the next endpoint.
-// 	endpoint = state.endpoints[state.index]
-// 	state.index = (state.index + 1) % len(state.endpoints)
-    endpoint = targetEndpoint
+	// 	endpoint = state.endpoints[state.index]
+	// 	state.index = (state.index + 1) % len(state.endpoints)
+	endpoint = targetEndpoint
 
 	if sessionAffinityEnabled {
 		var affinity *affinityState
@@ -984,7 +999,7 @@ func (lb *LoadBalancer) dialEndpoint(protocol, endpoint string) (net.Conn, error
 	if !ok {
 		return nil, fmt.Errorf("invalid endpoint %s", endpoint)
 	}
-    klog.Infof("Parse endpoint, target address: %s", net.JoinHostPort(targetIP, targetPort))
+	klog.Infof("Parse endpoint, target address: %s", net.JoinHostPort(targetIP, targetPort))
 
 	switch targetNode {
 	case defaults.EmptyNodeName, lb.Config.NodeName:

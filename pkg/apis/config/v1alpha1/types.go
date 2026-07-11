@@ -173,6 +173,18 @@ type EdgeProxyConfig struct {
 	// Allowed values are: "FilterIfLabelExists", "FilterIfLabelDoesNotExists"
 	// default "FilterIfLabelExists"
 	ServiceFilterMode defaults.ServiceFilterMode `json:"serviceFilterMode,omitempty"`
+	// ManagedRuntime enables the opt-in RuntimeService data path. Legacy Service,
+	// NodePort and JMES behavior is unchanged when this block is disabled.
+	ManagedRuntime *ManagedRuntimeConfig `json:"managedRuntime,omitempty"`
+}
+
+// ManagedRuntimeConfig configures the isolated RuntimeService mesh projection.
+// It consumes only explicitly labelled ClusterIP Services and their Endpoints
+// from the same Kubernetes client used by EdgeProxy (MetaServer in EdgeMode).
+type ManagedRuntimeConfig struct {
+	// Enable opts in to the managed RuntimeService data path.
+	// default false
+	Enable bool `json:"enable,omitempty"`
 }
 
 // Socks5Proxy indicates the socks5 proxy config
