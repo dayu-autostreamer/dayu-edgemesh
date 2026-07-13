@@ -27,9 +27,14 @@ HELM_DIR=${KUBE_ROOT}/build/helm
 _tmpdir=/tmp/edgemesh
 
 function verify:package:helm:files {
-    mkdir -p ${_tmpdir}
-    cd $EDGEMESH_HELM_DIR && helm package . -d ${_tmpdir} > /dev/null && mv ${_tmpdir}/edgemesh-0.1.0.tgz ${_tmpdir}/edgemesh.tgz
-    cd $GATEWAY_HELM_DIR && helm package . -d ${_tmpdir}  > /dev/null && mv ${_tmpdir}/edgemesh-gateway-0.1.0.tgz ${_tmpdir}/edgemesh-gateway.tgz
+    local edgemesh_chart_version gateway_chart_version
+    mkdir -p "${_tmpdir}"
+    edgemesh_chart_version=$(awk '$1 == "version:" {print $2; exit}' "${EDGEMESH_HELM_DIR}/Chart.yaml")
+    gateway_chart_version=$(awk '$1 == "version:" {print $2; exit}' "${GATEWAY_HELM_DIR}/Chart.yaml")
+    helm package "${EDGEMESH_HELM_DIR}" -d "${_tmpdir}" > /dev/null
+    mv "${_tmpdir}/edgemesh-${edgemesh_chart_version}.tgz" "${_tmpdir}/edgemesh.tgz"
+    helm package "${GATEWAY_HELM_DIR}" -d "${_tmpdir}" > /dev/null
+    mv "${_tmpdir}/edgemesh-gateway-${gateway_chart_version}.tgz" "${_tmpdir}/edgemesh-gateway.tgz"
     edgemesh_checksum=$(tar -xOzf ${HELM_DIR}/edgemesh.tgz | sort | sha1sum | awk '{ print $1 }')
     temp_edgemesh_checksum=$(tar -xOzf ${_tmpdir}/edgemesh.tgz | sort | sha1sum | awk '{ print $1 }')
     if [ "$edgemesh_checksum" != "$temp_edgemesh_checksum" ]; then

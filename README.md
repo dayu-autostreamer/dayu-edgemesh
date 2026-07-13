@@ -3,6 +3,10 @@
 ## Brief Introduction
 This project is based on [Edgemesh](https://github.com/kubeedge/edgemesh/) (v1.17.0)
 
+The current Dayu EdgeMesh version is [`v1.1`](https://github.com/dayu-autostreamer/dayu-edgemesh/tree/v1.1).
+The legacy `v1.0` baseline and the managed-runtime changes in `v1.1` are documented in the
+[changelog](CHANGELOG.md).
+
 We remove the loadbalancer policy of edgemesh and add extra validation for service state reconciliation in edgemesh-agent, to meet the requirements of dayu system.
 
 ## Features
@@ -70,7 +74,7 @@ helm upgrade --install edgemesh ./build/helm/edgemesh \
   --namespace kubeedge \
   --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
   --set agent.modules.edgeProxy.managedRuntime.enable=true \
-  --set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1
+  --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
 ```
 
 Rendering fails if the gate is enabled without that image. Raw-manifest users
@@ -113,7 +117,7 @@ compatibility boundary, state model, status API, and rollout procedure.
 
 clone repository
 ```bash
-git clone https://github.com/dayu-autostreamer/dayu-edgemesh
+git clone --branch v1.1 https://github.com/dayu-autostreamer/dayu-edgemesh
 ```
 
 add relay node
@@ -145,7 +149,7 @@ kubectl delete -f build/agent/resources/
 
 clone repository
 ```bash
-git clone https://github.com/dayu-autostreamer/dayu-edgemesh
+git clone --branch v1.1 https://github.com/dayu-autostreamer/dayu-edgemesh
 ```
 
 set meta information of building
@@ -157,11 +161,11 @@ vim hack/resource/driver_opts.toml
 
 # set docker meta info
 # default REG is docker.io
-# default REPO is dayuhub
-# default TAG is v1.0
+# default IMAGE_REPO is $(REG)/dayuhub
+# default IMAGE_TAG is v1.1
 export REG=xxx
-export REPO=xxx
-export TAG=xxx
+export IMAGE_REPO=xxx
+export IMAGE_TAG=v1.1
 ```
 
 Cross build edgemesh-agent and edgemesh-server image

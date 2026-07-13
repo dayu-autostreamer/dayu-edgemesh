@@ -16,7 +16,7 @@ GOPATH?=$(shell go env GOPATH)
 REGISTRY := $(or $(REG),docker.io)
 IMAGE_REPO ?= $(REGISTRY)/dayuhub
 ARCH ?= amd64
-IMAGE_TAG ?= v1.0
+IMAGE_TAG ?= v1.1
 GO_LDFLAGS='$(shell hack/make-rules/version.sh)'
 
 # make all builds both agent and server binaries

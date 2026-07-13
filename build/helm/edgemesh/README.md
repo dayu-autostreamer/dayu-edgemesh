@@ -52,7 +52,7 @@ helm upgrade --install edgemesh ./build/helm/edgemesh \
 --namespace kubeedge \
 --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
 --set agent.modules.edgeProxy.managedRuntime.enable=true \
---set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1
+--set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
 ```
 
 The chart fails rendering when the gate is enabled without the explicit image;

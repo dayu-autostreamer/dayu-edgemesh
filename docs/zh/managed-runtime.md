@@ -156,7 +156,7 @@ UID 的 `200` 当作本版本的激活确认。
      --namespace kubeedge \
      --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
      --set agent.modules.edgeProxy.managedRuntime.enable=true \
-     --set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1
+     --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
    ```
 4. 在每个节点确认 `curl -fsS http://127.0.0.1:10551/readyz` 成功。
 5. 创建新的 RuntimeService revision；只有精确状态查询返回 `200` 后，才将其

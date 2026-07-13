@@ -18,7 +18,7 @@ EdgeMesh 的 Helm Chart 配置放在 build/helm/edgemesh 目录下。
 | commonConfig     | object | --set agent.commonConfig.bridgeDeviceIP=169.254.96.16 | 与 configmap 的 commonConfig 含义相同  |
 | modules          | object | --set agent.modules.edgeProxy.socks5Proxy.enable=true | 与 configmap 的 modules 含义相同       |
 | agent.modules.edgeProxy.managedRuntime | object | --set agent.modules.edgeProxy.managedRuntime.enable=true | 启用 Dayu RuntimeService 链路，默认 false |
-| agent.modules.edgeProxy.managedRuntime.image | string | --set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1 | 启用托管运行时时必填的同 revision agent 镜像 |
+| agent.modules.edgeProxy.managedRuntime.image | string | --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1 | 启用托管运行时时必填的同 revision agent 镜像 |
 
 ### EdgeMesh-Gateway
 

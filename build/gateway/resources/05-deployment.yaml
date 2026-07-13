@@ -23,7 +23,7 @@ spec:
         - name: edgemesh-gateway
           securityContext:
             privileged: true
-          image: dayuhub/edgemesh-gateway:v1.0
+          image: dayuhub/edgemesh-gateway:v1.1
           imagePullPolicy: Always
           env:
             - name: NODE_NAME

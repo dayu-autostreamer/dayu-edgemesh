@@ -18,7 +18,7 @@ The Helm Chart configuration of EdgeMesh is placed in the build/helm/edgemesh di
 | commonConfig     | object | --set agent.commonConfig.bridgeDeviceIP=169.254.96.16 | Same meaning as commonConfig in configmap       |
 | modules          | object | --set agent.modules.edgeProxy.socks5Proxy.enable=true | Same meaning as modules in configmap            |
 | agent.modules.edgeProxy.managedRuntime | object | --set agent.modules.edgeProxy.managedRuntime.enable=true | Opt-in Dayu RuntimeService path; default false |
-| agent.modules.edgeProxy.managedRuntime.image | string | --set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1 | Required same-revision agent image when managed runtime is enabled |
+| agent.modules.edgeProxy.managedRuntime.image | string | --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1 | Required same-revision agent image when managed runtime is enabled |
 
 ### EdgeMesh-Gateway
 

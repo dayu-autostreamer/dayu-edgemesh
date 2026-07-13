@@ -189,7 +189,7 @@ revision or Pod UID is not an activation acknowledgement.
      --namespace kubeedge \
      --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
      --set agent.modules.edgeProxy.managedRuntime.enable=true \
-     --set-string agent.modules.edgeProxy.managedRuntime.image=registry.example.com/dayu/edgemesh-agent:runtime-v1
+     --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
    ```
 4. Confirm `curl -fsS http://127.0.0.1:10551/readyz` succeeds on each node.
 5. Create a RuntimeService revision and require an exact `200` activation
