@@ -62,6 +62,27 @@ func TestStorePublishesOnlyExactAppliedManagedRoute(t *testing.T) {
 	}
 }
 
+func TestStoreIgnoresUnlabelledLegacyService(t *testing.T) {
+	store := NewStore()
+	service, endpoints := managedObjects("legacy-service", "legacy-runtime")
+	service.Spec.Type = v1.ServiceTypeNodePort
+	delete(service.Labels, LabelMeshManaged)
+	delete(endpoints.Labels, LabelMeshManaged)
+
+	if err := store.UpsertService(service); err != nil {
+		t.Fatalf("upsert legacy Service: %v", err)
+	}
+	if err := store.UpsertEndpoints(endpoints); err != nil {
+		t.Fatalf("upsert legacy Endpoints: %v", err)
+	}
+	if routes := store.Snapshot().Routes; len(routes) != 0 {
+		t.Fatalf("legacy Service entered managed projection: %#v", routes)
+	}
+	if endpoint, managed, applied := store.ManagedEndpoint(servicePortName(service)); endpoint != "" || managed || applied {
+		t.Fatalf("legacy Service classified as managed: endpoint=%q managed=%v applied=%v", endpoint, managed, applied)
+	}
+}
+
 func TestPortalPendingCanArriveBeforeInformerHandlers(t *testing.T) {
 	store := NewStore()
 	service, endpoints := managedObjects("service-a", "runtime-service-a")

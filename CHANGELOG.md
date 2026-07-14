@@ -4,7 +4,7 @@ All notable changes to the Dayu EdgeMesh fork are documented in this file. The
 versions below describe the Dayu integration layer; upstream EdgeMesh and
 Kubernetes API versions remain unchanged.
 
-## [v1.1] - 2026-07-13
+## [v1.1] - 2026-07-14
 
 ### Added
 
@@ -24,15 +24,27 @@ Kubernetes API versions remain unchanged.
 - Set the default Dayu EdgeMesh image build and raw-manifest tags to `v1.1`,
   and replaced temporary managed-runtime image examples with immutable `v1.1`
   references.
-- Bumped the changed EdgeMesh and agent Helm charts to `0.2.0`, the gateway
+- Enabled EdgeProxy and managed RuntimeService routing by default across the Go
+  configuration, raw manifests, and Helm values, with the matching v1.1 agent
+  image embedded so Dayu v1.4 needs no feature-specific deployment override.
+- Bumped the changed EdgeMesh and agent Helm charts to `0.2.1`, the gateway
   chart to `0.1.1`, and regenerated both tracked chart packages. Helm chart
   versions remain independent from the Dayu release tag.
+- Documented one-agent coexistence for Dayu v1.3 JMES/NodePort and Dayu v1.4
+  RuntimeService traffic in separate namespaces.
+
+### Fixed
+
+- Corrected the raw agent ConfigMap so `managedRuntime`, `loadBalancer`, and
+  their nested settings are emitted under `modules.edgeProxy`, and added a
+  regression test for the embedded configuration structure.
 
 ### Compatibility
 
-- Managed runtime remains disabled by default. Existing unlabelled Services,
-  `JointMultiEdgeService`, NodePort routing, and stale-service validation keep
-  their legacy behavior.
+- Managed runtime is enabled by default, but existing unlabelled Services,
+  `JointMultiEdgeService`, and NodePort routing retain their legacy data path.
+  Setting the gate to `false` remains available for strict pre-managed
+  validation behavior.
 - The current Dayu managed-runtime path requires both dayu-edgemesh `v1.1` and
   dayu-sedna `v1.1`; `v1.0` does not implement exact-route activation.
 

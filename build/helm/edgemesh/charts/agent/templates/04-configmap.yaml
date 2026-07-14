@@ -101,7 +101,7 @@ data:
         {{- end }}
         {{- if .Values.modules.edgeProxy.managedRuntime }}
         managedRuntime:
-          enable: {{ .Values.modules.edgeProxy.managedRuntime.enable | default false }}
+          enable: {{ .Values.modules.edgeProxy.managedRuntime.enable }}
         {{- end }}
         {{- if .Values.modules.edgeProxy.socks5Proxy }}
         socks5Proxy:

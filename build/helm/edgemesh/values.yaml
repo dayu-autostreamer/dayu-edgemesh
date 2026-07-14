@@ -31,13 +31,13 @@ agent:
   modules:
     edgeProxy:
       enable: true
-      # Disabled by default for backward compatibility with the legacy
-      # JointMultiEdgeService/NodePort path.
+      serviceFilterMode: FilterIfLabelExists
+      # Enabled by default for Dayu v1.4. Unlabelled v1.0-v1.3 Services retain
+      # the legacy JointMultiEdgeService/NodePort data path.
       managedRuntime:
-        enable: false
-        # Required when enable=true. Use an immutable edgemesh-agent image
-        # built from the same source revision as this chart.
-        image: ""
+        enable: true
+        # Immutable agent image built from the same source revision as this chart.
+        image: dayuhub/edgemesh-agent:v1.1
     edgeTunnel:
       enable: true
     edgeCNI:

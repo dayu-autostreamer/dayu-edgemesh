@@ -12,17 +12,18 @@ data:
     modules:
       edgeProxy:
         enable: true
-        # Opt-in Dayu RuntimeService route projection. Keep false to preserve
-        # the legacy JointMultiEdgeService/NodePort proxy path unchanged.
-      managedRuntime:
-        # Before enabling, deploy an edgemesh-agent image built from this
-        # source revision; the upstream v1.17.0 image lacks this contract.
-        enable: false
+        # Required by the managed RuntimeService path. It is also the default,
+        # but keeping it explicit makes raw-manifest enablement deterministic.
+        serviceFilterMode: FilterIfLabelExists
+        # Enabled for Dayu v1.4 RuntimeServices. Unlabelled Services from Dayu
+        # v1.0-v1.3 remain on the legacy JointMultiEdgeService/NodePort path.
+        managedRuntime:
+          enable: true
         loadBalancer:
           consistentHash:
-          partitionCount: 1000
-          replicationFactor: 10
-          load: 1.25
+            partitionCount: 1000
+            replicationFactor: 10
+            load: 1.25
       edgeTunnel:
         enable: true
         #relayNodes:

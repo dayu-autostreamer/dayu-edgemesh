@@ -46,7 +46,7 @@ If direct validation is enabled successfully, `edgemesh-agent` will log:
 Using independent Kubernetes API validation source for EdgeMesh proxy state
 ```
 
-### Opt-in RuntimeService Data Path
+### RuntimeService Data Path
 
 Dayu-Edgemesh now includes a revision-scoped data path for Sedna
 `RuntimeService` workloads. It replaces per-runtime Kubernetes discovery with
@@ -54,7 +54,7 @@ one local, in-memory projection built from EdgeProxy's existing Service and
 Endpoints informers. No extra watch, polling loop, hosts file, or persistent
 cache is introduced on an edge node.
 
-This path is deliberately disabled by default:
+Dayu EdgeMesh enables this path by default for Dayu v1.4:
 
 ```yaml
 modules:
@@ -62,31 +62,31 @@ modules:
     enable: true
     serviceFilterMode: FilterIfLabelExists
     managedRuntime:
-      enable: false
+      enable: true
 ```
 
-The Helm chart treats enablement as a managed install profile and requires an
-explicit agent image built from this source revision. This prevents a new
-ConfigMap from being paired silently with the default upstream binary:
+The raw manifests and Helm chart already pair this configuration with the
+same-revision `dayuhub/edgemesh-agent:v1.1` image. A clean deployment therefore
+needs no RuntimeService-specific override:
 
 ```sh
 helm upgrade --install edgemesh ./build/helm/edgemesh \
-  --namespace kubeedge \
-  --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
-  --set agent.modules.edgeProxy.managedRuntime.enable=true \
-  --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
+  --namespace kubeedge
 ```
 
-Rendering fails if the gate is enabled without that image. Raw-manifest users
-must likewise replace the agent DaemonSet image before changing the gate.
+Private registries only need to override
+`agent.modules.edgeProxy.managedRuntime.image` or the image in
+`build/agent/resources/05-daemonset.yaml`; the gate and filter mode do not need
+to be edited.
 
-With `enable: false`, the existing `JointMultiEdgeService`/NodePort path and
-its independent stale-service validation remain unchanged. Enabling the gate
-adds exact routing only for ClusterIP Services labelled
+The gate adds exact routing only for ClusterIP Services labelled
 `dayu.io/mesh-managed=true`; unlabelled Services retain legacy proxy behavior.
-When the gate is enabled, both managed and legacy Services use the primary
+This allows one v1.1 agent on each node to serve Dayu v1.3 JMES/NodePort traffic
+and Dayu v1.4 RuntimeService traffic in different namespaces at the same time.
+Both managed and legacy Services use the primary
 MetaServer-backed informer as their validation source, avoiding a second
-cloud API request path on edge nodes.
+cloud API request path on edge nodes. Set the gate to `false` only when rolling
+back to the exact pre-managed validation behavior.
 
 A managed route becomes selectable only after all of the following agree on
 the same revision and Kubernetes object incarnation:
@@ -117,7 +117,7 @@ compatibility boundary, state model, status API, and rollout procedure.
 
 clone repository
 ```bash
-git clone --branch v1.1 https://github.com/dayu-autostreamer/dayu-edgemesh
+git clone https://github.com/dayu-autostreamer/dayu-edgemesh
 ```
 
 add relay node

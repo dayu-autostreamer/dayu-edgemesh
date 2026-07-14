@@ -42,19 +42,17 @@ helm uninstall edgemesh -n kubeedge
 
 ## Dayu managed runtime profile
 
-The chart defaults to the upstream agent image and keeps Dayu managed runtime
-disabled, preserving legacy JMES/NodePort behavior. To enable the managed path,
-use this fork's chart and provide an immutable `edgemesh-agent` image built from
-the same source revision:
+The chart enables Dayu managed runtime by default and pairs it with the
+same-revision `dayuhub/edgemesh-agent:v1.1` image. A normal Dayu v1.4 install
+therefore needs no feature-specific values:
 
 ```
 helm upgrade --install edgemesh ./build/helm/edgemesh \
---namespace kubeedge \
---set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
---set agent.modules.edgeProxy.managedRuntime.enable=true \
---set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
+--namespace kubeedge
 ```
 
-The chart fails rendering when the gate is enabled without the explicit image;
-`agent.image` remains the backward-compatible image setting while the gate is
-disabled.
+Override `agent.modules.edgeProxy.managedRuntime.image` only for a private
+registry. Unlabelled Dayu v1.3 JMES/NodePort Services remain on the legacy data
+path while labelled Dayu v1.4 RuntimeServices use managed routing. Set
+`agent.modules.edgeProxy.managedRuntime.enable=false` only to roll back to the
+pre-managed validation behavior.

@@ -107,3 +107,30 @@ func TestManagedRoutePrecedesAndBlocksLegacySelection(t *testing.T) {
 		t.Fatalf("selected %q instead of exact managed endpoint", endpoint)
 	}
 }
+
+func TestManagedRuntimeCoexistsWithLegacyService(t *testing.T) {
+	store := meshstate.NewStore()
+	name := proxy.ServicePortName{
+		NamespacedName: types.NamespacedName{Namespace: "dayu-v13", Name: "legacy-processor"},
+		Port:           "tcp-0",
+	}
+	legacyEndpoint := "edge-v13:legacy-pod:10.244.0.13:8080"
+	lb := &LoadBalancer{
+		hostname:       "edge-v13",
+		managedRuntime: store,
+		services: map[proxy.ServicePortName]*balancerState{
+			name: {
+				endpoints: []string{legacyEndpoint},
+				affinity:  *newAffinityPolicy(v1.ServiceAffinityNone, 0),
+			},
+		},
+	}
+
+	endpoint, _, err := lb.nextEndpointWithConn(name, &net.TCPAddr{}, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != legacyEndpoint {
+		t.Fatalf("legacy Dayu v1.3 endpoint = %q, want %q", endpoint, legacyEndpoint)
+	}
+}

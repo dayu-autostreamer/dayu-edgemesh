@@ -17,8 +17,8 @@ EdgeMesh 的 Helm Chart 配置放在 build/helm/edgemesh 目录下。
 | kubeAPIConfig    | object | --set agent.kubeAPIConfig.master=https://1.1.1.1:6443 | 与 configmap 的 kubeAPIConfig 含义相同 |
 | commonConfig     | object | --set agent.commonConfig.bridgeDeviceIP=169.254.96.16 | 与 configmap 的 commonConfig 含义相同  |
 | modules          | object | --set agent.modules.edgeProxy.socks5Proxy.enable=true | 与 configmap 的 modules 含义相同       |
-| agent.modules.edgeProxy.managedRuntime | object | --set agent.modules.edgeProxy.managedRuntime.enable=true | 启用 Dayu RuntimeService 链路，默认 false |
-| agent.modules.edgeProxy.managedRuntime.image | string | --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1 | 启用托管运行时时必填的同 revision agent 镜像 |
+| agent.modules.edgeProxy.managedRuntime | object | --set agent.modules.edgeProxy.managedRuntime.enable=false | Dayu RuntimeService 链路默认开启；仅回滚时设为 false |
+| agent.modules.edgeProxy.managedRuntime.image | string | --set-string agent.modules.edgeProxy.managedRuntime.image=repo/edgemesh-agent:v1.1 | 同 revision agent 镜像，默认 dayuhub/edgemesh-agent:v1.1 |
 
 ### EdgeMesh-Gateway
 
@@ -75,11 +75,9 @@ modules:
       - 1.1.1.1
       cacheTTL: 30
   edgeProxy:
-    enable: false
-    # 选择性启用 Dayu RuntimeService 投影。false 保持原有
-    # JointMultiEdgeService/NodePort 链路不变。
+    enable: true
     managedRuntime:
-      enable: false
+      enable: true
     socks5Proxy:
       enable: false
       listenPort: 10800

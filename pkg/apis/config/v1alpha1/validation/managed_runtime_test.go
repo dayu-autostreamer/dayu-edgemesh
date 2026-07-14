@@ -66,10 +66,19 @@ func TestValidateManagedRuntimeFeatureGate(t *testing.T) {
 	}
 }
 
-func TestDefaultConfigurationKeepsManagedRuntimeDisabled(t *testing.T) {
+func TestDefaultConfigurationEnablesManagedRuntime(t *testing.T) {
 	config := v1alpha1.NewDefaultEdgeMeshAgentConfig("/tmp/edgemesh-agent.yaml")
-	managed := config.Modules.EdgeProxyConfig.ManagedRuntime
-	if managed == nil || managed.Enable {
-		t.Fatalf("default managedRuntime = %#v, want explicit enable=false", managed)
+	edgeProxy := config.Modules.EdgeProxyConfig
+	if edgeProxy == nil || !edgeProxy.Enable {
+		t.Fatalf("default edgeProxy = %#v, want enable=true", edgeProxy)
+	}
+	if edgeProxy.ManagedRuntime == nil || !edgeProxy.ManagedRuntime.Enable {
+		t.Fatalf("default managedRuntime = %#v, want enable=true", edgeProxy.ManagedRuntime)
+	}
+	if edgeProxy.ServiceFilterMode != defaults.FilterIfLabelExistsMode {
+		t.Fatalf("default serviceFilterMode = %q, want %q", edgeProxy.ServiceFilterMode, defaults.FilterIfLabelExistsMode)
+	}
+	if errs := ValidateModuleEdgeProxy(edgeProxy); len(errs) != 0 {
+		t.Fatalf("default EdgeProxy configuration is invalid: %v", errs)
 	}
 }

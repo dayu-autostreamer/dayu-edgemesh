@@ -182,8 +182,10 @@ type EdgeProxyConfig struct {
 // It consumes only explicitly labelled ClusterIP Services and their Endpoints
 // from the same Kubernetes client used by EdgeProxy (MetaServer in EdgeMode).
 type ManagedRuntimeConfig struct {
-	// Enable opts in to the managed RuntimeService data path.
-	// default false
+	// Enable activates the managed RuntimeService data path. Dayu EdgeMesh
+	// enables it by default; unlabelled legacy Services still use the original
+	// proxy path.
+	// default true
 	Enable bool `json:"enable,omitempty"`
 }
 

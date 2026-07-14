@@ -9,8 +9,8 @@ receives from the KubeEdge MetaServer into immutable in-memory snapshots.
 
 The design has three hard boundaries:
 
-1. It is opt-in. Existing `JointMultiEdgeService`, NodePort, and unlabelled
-   Service behavior is preserved.
+1. It is label-isolated. Existing `JointMultiEdgeService`, NodePort, and
+   unlabelled Service behavior is preserved while the feature is enabled.
 2. It is event-driven. No second Kubernetes client, periodic list, synchronous
    cache refresh, hosts file, or EdgeMesh checkpoint is added.
 3. It is fail-closed. An incomplete or ambiguous managed route never enters
@@ -23,7 +23,8 @@ managed store is only a validated, immutable projection for data-plane reads.
 ## Compatibility boundary
 
 The feature gate is under `modules.edgeProxy.managedRuntime.enable` and defaults
-to `false`.
+to `true` in the Dayu v1.1 distribution so Dayu v1.4 works without a deployment
+override.
 
 | Gate | Managed Service | Legacy Service / JMES / NodePort | Validation source |
 |---|---|---|---|
@@ -35,11 +36,28 @@ Enabling managed runtime requires EdgeProxy to be enabled and
 other combination. Rollback is therefore a single configuration change to
 `managedRuntime.enable: false`; no legacy CRD or proxy code is removed.
 
-For Helm, enablement is also a fail-fast image profile. The chart requires
-`agent.modules.edgeProxy.managedRuntime.image` to be an immutable agent image
-built from the same source revision whenever the gate is true; it will not pair
-the new configuration with its default upstream image. Raw-manifest users must
-replace the agent DaemonSet image before enabling the gate.
+The raw manifests and Helm chart default to the immutable
+`dayuhub/edgemesh-agent:v1.1` image that contains this implementation. Private
+registries can override `agent.modules.edgeProxy.managedRuntime.image` without
+changing the feature gate.
+
+## Dayu v1.3 and v1.4 coexistence
+
+One v1.1 EdgeMesh agent per node can serve both generations concurrently:
+
+- deploy Dayu v1.3 and v1.4 control planes in distinct namespaces;
+- run a single matching dayu-sedna v1.1 GM/LC plane and one dayu-edgemesh v1.1
+  agent DaemonSet across their target nodes;
+- v1.3 JMES/NodePort Services remain unlabelled and use the legacy proxy and
+  load-balancer state;
+- v1.4 RuntimeService Services carry `dayu.io/mesh-managed=true` and use the
+  exact fail-closed projection.
+
+Do not run a second EdgeMesh agent on the same node. Both agents would own the
+same host-network proxy/iptables state and compete for `127.0.0.1:10551`.
+With the gate enabled, legacy validation also reuses the primary MetaServer
+informer cache; routing semantics remain legacy, but stale-object validation is
+no longer sourced from a separate cloud API client.
 
 ## Data and acknowledgement flow
 
@@ -177,22 +195,21 @@ revision or Pod UID is not an activation acknowledgement.
 
 ## Enablement and rollback
 
-1. Deploy versions of Sedna and EdgeMesh that contain the RuntimeService
-   support while leaving `managedRuntime.enable: false`.
-2. Confirm existing JMES and NodePort traffic is unchanged.
-3. Set EdgeProxy `serviceFilterMode: FilterIfLabelExists` and
-   `managedRuntime.enable: true`, provide the same-revision agent image, then
-   roll out EdgeMesh. For Helm:
+1. Deploy matching dayu-sedna v1.1 and dayu-edgemesh v1.1 components. The raw
+   manifests and Helm values already enable managed runtime with a matching
+   image.
+2. Roll out EdgeMesh. For Helm, no feature-specific values are required:
 
    ```sh
    helm upgrade --install edgemesh ./build/helm/edgemesh \
-     --namespace kubeedge \
-     --set agent.modules.edgeProxy.serviceFilterMode=FilterIfLabelExists \
-     --set agent.modules.edgeProxy.managedRuntime.enable=true \
-     --set-string agent.modules.edgeProxy.managedRuntime.image=dayuhub/edgemesh-agent:v1.1
+     --namespace kubeedge
    ```
+
+   Override only the image value when using a private registry.
+3. Confirm existing v1.3 JMES/NodePort traffic remains healthy when both
+   generations share the agent.
 4. Confirm `curl -fsS http://127.0.0.1:10551/readyz` succeeds on each node.
-5. Create a RuntimeService revision and require an exact `200` activation
+5. Create a v1.4 RuntimeService revision and require an exact `200` activation
    response before publishing it in Dayu's runtime directory.
 6. Roll back by setting the gate to `false`; legacy resources need no change.
 
