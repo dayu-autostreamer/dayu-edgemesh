@@ -11,8 +11,9 @@ Service/Endpoints informer，将 KubeEdge MetaServer 已同步到边缘节点的
 
 1. 按标签隔离。开启功能时，原有 `JointMultiEdgeService`、NodePort 和未标记
    Service 的行为仍然保持不变。
-2. 完全事件驱动。不新增 Kubernetes client、周期 List、同步强刷缓存、hosts
-   文件或 EdgeMesh 持久化 checkpoint。
+2. 复用主 informer 和 MetaServer client。不新增 Kubernetes client、watch、
+   周期 List、hosts 文件或 EdgeMesh 持久化 checkpoint；仅对无效 managed 投影
+   执行有界点查。
 3. 托管对象失败关闭。资源不完整、身份不一致或代理尚未生效时，绝不会回退
    到旧的随机负载均衡链路。
 
@@ -64,13 +65,17 @@ Sedna RuntimeService controller
   -> KubeEdge MetaManager / MetaServer
   -> EdgeMesh 现有 Service + Endpoints informer
   -> managed 内存投影
+  -> 仅 DEGRADED 状态触发的 MetaServer 点查修复
   -> userspace portal 生命周期（PENDING -> APPLIED -> REMOVING -> REMOVED）
   -> 本机状态 API
   -> Sedna local-controller 激活确认
 ```
 
 informer handler 不执行磁盘 I/O；数据面从原子快照取路由，不发起 Kubernetes
-API 请求。
+API 请求。主 informer 完成首次同步后，修复 worker 只检查 Service/Endpoints
+契约尚未通过的 managed key；每 15 秒通过现有 MetaServer client 分别执行一次
+有超时边界的 Service GET 和 Endpoints GET，并将返回对象送回同一验证路径。
+已经有效的路由不会产生修复请求。
 
 userspace proxier 会在尝试写入托管 portal 前先发出 `PENDING`。该事件携带精确
 Service UID，并立即将 namespaced key 标记为 managed；即使它早于投影侧的
@@ -128,8 +133,19 @@ Service label，但不保证复制 annotation，所以完整 annotation 只从 S
 
 只有 `APPLIED` 且 source 为 `SYNCED` 时数据面才会选择该路由。Service UID、
 RuntimeService UID 和 endpoint Pod UID 共同区分对象实例并防止 ABA 复用。
-Update 事件以 namespaced key 上的新对象为准；Delete 事件按 UID 防护，陈旧
-tombstone 不会删除新路由。portal 回调同样携带精确 Service UID。
+当当前值和传入值均为规范十进制整数时，Service 或 Endpoints 中较旧的 Kubernetes
+`resourceVersion` 会在覆盖当前投影前被忽略；较新的无效更新仍然保持
+fail-closed。Delete 事件按 UID 防护，陈旧 tombstone 不会删除新路由。portal
+回调同样携带精确 Service UID。
+
+该版本防护用于阻止 MetaServer watch 乱序投递破坏当前投影。如果 MetaManager
+保存了不完整对象但丢失后续恢复事件，仅针对无效投影的点查会通过同一个
+MetaServer 获取当前 Service 和 Endpoints，无需第二个云端 client 即可恢复。
+返回对象仍须通过完整资源契约和代理确认，因此链路继续保持 fail-closed。
+
+如果 MetaServer 点查本身也不可用或返回陈旧对象，EdgeMesh 无法凭空制造新鲜
+数据，路由会继续保持 `DEGRADED`，此时必须修复 KubeEdge 元数据链路。EdgeMesh
+不会绕过 MetaServer 直接连接云端 API。
 
 代理侧 `PENDING` 和 `REMOVING` 都会让路由退出 `APPLIED`；只有 `REMOVED`
 才能释放 tombstone。这些状态不会因 informer handler 的先后顺序而短暂误开。
@@ -152,8 +168,11 @@ hostNetwork，因此无需额外暴露 Kubernetes Service。
 | `GET /v1/routes` | 所有投影路由的诊断快照 |
 | `GET /v1/routes/{serviceUID}` | 按精确 Service UID 查询激活状态 |
 
-精确查询响应包含 Service UID、RuntimeService UID、endpoint Pod UID、deployment
-revision、runtime ID、target node、本地序列号和 source 状态。未知 UID 返回
+精确查询响应包含 Service UID、RuntimeService UID、当前观察到的 Service 和
+Endpoints resourceVersion、endpoint Pod UID、deployment revision、runtime ID、
+target node、本地序列号和 source 状态。两个 resourceVersion 可直接与云端及
+节点本机 MetaServer 对象对比，不需要再通过修改 annotation 人为触发事件。
+未知 UID 返回
 `404`；任一状态未达到 `APPLIED + SYNCED` 返回 `503`；只有身份与状态均精确
 匹配时返回 `200`。调用方仍必须逐一比较身份字段，不能把其他 revision 或 Pod
 UID 的 `200` 当作本版本的激活确认。

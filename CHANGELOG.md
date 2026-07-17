@@ -4,7 +4,7 @@ All notable changes to the Dayu EdgeMesh fork are documented in this file. The
 versions below describe the Dayu integration layer; upstream EdgeMesh and
 Kubernetes API versions remain unchanged.
 
-## [v1.1] - 2026-07-14
+## [v1.1] - 2026-07-17
 
 ### Added
 
@@ -38,6 +38,16 @@ Kubernetes API versions remain unchanged.
 - Corrected the raw agent ConfigMap so `managedRuntime`, `loadBalancer`, and
   their nested settings are emitted under `modules.edgeProxy`, and added a
   regression test for the embedded configuration structure.
+- Prevented out-of-order Service or Endpoints informer updates with older
+  canonical decimal `resourceVersion` values from replacing a newer
+  managed-runtime projection and leaving an otherwise ready route stuck in
+  `DEGRADED`.
+- Added a bounded, degraded-only Service/Endpoints point lookup through the
+  existing MetaServer client so a lost recovery watch event can self-heal
+  without introducing a second Kubernetes client or weakening fail-closed
+  routing.
+- Exposed the observed Service and Endpoints resource versions in the local
+  route status response for cache-path diagnosis.
 
 ### Compatibility
 

@@ -1,6 +1,7 @@
 package meshstate
 
 import (
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
@@ -42,9 +43,9 @@ func (r *Runtime) Close() error {
 	return r.status.Close()
 }
 
-func (r *Runtime) RegisterInformers(serviceInformer, endpointsInformer cache.SharedIndexInformer, stopCh <-chan struct{}) error {
+func (r *Runtime) RegisterInformers(client clientset.Interface, serviceInformer, endpointsInformer cache.SharedIndexInformer, stopCh <-chan struct{}) error {
 	if r == nil {
 		return nil
 	}
-	return r.controller.Register(serviceInformer, endpointsInformer, stopCh)
+	return r.controller.Register(client, serviceInformer, endpointsInformer, stopCh)
 }

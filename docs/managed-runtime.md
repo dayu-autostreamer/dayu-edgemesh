@@ -11,8 +11,9 @@ The design has three hard boundaries:
 
 1. It is label-isolated. Existing `JointMultiEdgeService`, NodePort, and
    unlabelled Service behavior is preserved while the feature is enabled.
-2. It is event-driven. No second Kubernetes client, periodic list, synchronous
-   cache refresh, hosts file, or EdgeMesh checkpoint is added.
+2. It reuses the primary informer and MetaServer client. No second Kubernetes
+   client, watch, periodic list, hosts file, or EdgeMesh checkpoint is added.
+   A bounded point lookup runs only for invalid managed projections.
 3. It is fail-closed. An incomplete or ambiguous managed route never enters
    the legacy/random load-balancer path.
 
@@ -69,13 +70,19 @@ Sedna RuntimeService controller
   -> KubeEdge MetaManager / MetaServer
   -> existing EdgeMesh Service + Endpoints informers
   -> managed in-memory projection
+  -> DEGRADED-only MetaServer point-lookup repair
   -> userspace portal lifecycle (PENDING -> APPLIED -> REMOVING -> REMOVED)
   -> loopback status API
   -> Sedna local-controller activation acknowledgement
 ```
 
-There is no third cache to refresh. Informer handlers do no filesystem I/O,
-and data-plane selection reads an atomic snapshot without Kubernetes API calls.
+There is no third persistent cache to refresh. Informer handlers do no
+filesystem I/O, and data-plane selection reads an atomic snapshot without
+Kubernetes API calls. After initial informer sync, a repair worker checks only
+managed keys whose Service/Endpoints contract is currently invalid. Every 15
+seconds it performs one bounded Service GET and Endpoints GET through the
+existing MetaServer client, then passes the returned objects through the same
+validation path. Valid routes generate no repair traffic.
 
 The userspace proxier emits `PENDING` before it attempts to program a managed
 portal. This first event records the Service UID and marks the namespaced key as
@@ -143,9 +150,24 @@ Every route is one of:
 
 Data-plane selection is allowed only for `APPLIED` plus source `SYNCED`.
 `Service UID`, `RuntimeService UID`, and endpoint `Pod UID` distinguish object
-incarnations and prevent ABA reuse. Update events supersede older objects at a
-namespaced key; delete events are UID-guarded so stale tombstones cannot remove
-a newer route. Portal callbacks also carry the exact Service UID.
+incarnations and prevent ABA reuse. When both values are canonical decimal
+integers, an incoming Service or Endpoints update with an older Kubernetes
+`resourceVersion` is ignored before it can replace the current projection.
+Newer invalid updates still fail closed. Delete events are UID-guarded so stale
+tombstones cannot remove a newer route. Portal callbacks also carry the exact
+Service UID.
+
+This version guard protects the projection from out-of-order MetaServer watch
+delivery. If MetaManager stores an incomplete object and loses its recovery
+event, the degraded-only point lookup asks the same MetaServer for the current
+Service and Endpoints and can recover the route without a second cloud client.
+The returned objects must still pass the exact contract and proxy
+acknowledgement, so the path remains fail-closed.
+
+The repair cannot manufacture freshness when MetaServer's point GET is also
+unavailable or stale. In that source-level failure mode the route remains
+`DEGRADED`; the KubeEdge metadata path must be repaired. EdgeMesh deliberately
+does not bypass MetaServer with a direct cloud API client.
 
 The proxy's `PENDING` and `REMOVING` lifecycle events force the route out of
 `APPLIED`; `REMOVED` alone may release the tombstone. These transitions cannot
@@ -177,6 +199,8 @@ The exact-route endpoint returns:
 {
   "serviceUID": "...",
   "runtimeServiceUID": "...",
+  "serviceResourceVersion": "12345",
+  "endpointsResourceVersion": "12346",
   "endpointPodUID": "...",
   "deploymentRevision": 7,
   "runtimeID": "runtime-a",
@@ -187,6 +211,10 @@ The exact-route endpoint returns:
   "observedAt": "2026-01-01T00:00:00Z"
 }
 ```
+
+The two observed resource versions make it possible to compare EdgeMesh's
+projection with cloud and node-local MetaServer objects without mutating the
+resource to provoke another event.
 
 Status codes are `404` for an unknown Service UID, `503` for any route not
 exactly `APPLIED` with a synced source, and `200` only for the exact applied

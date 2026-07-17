@@ -51,8 +51,9 @@ Using independent Kubernetes API validation source for EdgeMesh proxy state
 Dayu-Edgemesh now includes a revision-scoped data path for Sedna
 `RuntimeService` workloads. It replaces per-runtime Kubernetes discovery with
 one local, in-memory projection built from EdgeProxy's existing Service and
-Endpoints informers. No extra watch, polling loop, hosts file, or persistent
-cache is introduced on an edge node.
+Endpoints informers. No extra watch, Kubernetes client, hosts file, or
+persistent cache is introduced on an edge node. A bounded point-lookup repair
+uses the same MetaServer client only while a managed projection is invalid.
 
 Dayu EdgeMesh enables this path by default for Dayu v1.4:
 

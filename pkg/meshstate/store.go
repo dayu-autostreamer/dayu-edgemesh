@@ -83,15 +83,23 @@ func (s *Store) UpsertService(service *v1.Service) error {
 	defer s.mu.Unlock()
 
 	key := namespacedKey(service.Namespace, service.Name)
+	current := s.services[key]
+	if current != nil && isOlderNumericResourceVersion(current.ResourceVersion, service.ResourceVersion) {
+		klog.InfoS("Ignore stale managed Service projection event",
+			"service", key,
+			"currentResourceVersion", current.ResourceVersion,
+			"incomingResourceVersion", service.ResourceVersion)
+		return nil
+	}
 	if service.Labels[LabelMeshManaged] != "true" {
 		// An informer Update to a non-managed current object supersedes any
 		// previously observed managed incarnation at this namespaced key.
-		if current := s.services[key]; current != nil {
+		if current != nil {
 			return s.retireServiceLocked(current, "Service replaced or mesh-managed label removed")
 		}
 		return nil
 	}
-	if current := s.services[key]; current != nil && current.UID != service.UID {
+	if current != nil && current.UID != service.UID {
 		if err := s.retireServiceLocked(current, "Service UID replaced"); err != nil {
 			return err
 		}
@@ -109,6 +117,14 @@ func (s *Store) UpsertEndpoints(endpoints *v1.Endpoints) error {
 	defer s.mu.Unlock()
 
 	key := namespacedKey(endpoints.Namespace, endpoints.Name)
+	current := s.endpoints[key]
+	if current != nil && isOlderNumericResourceVersion(current.ResourceVersion, endpoints.ResourceVersion) {
+		klog.InfoS("Ignore stale managed Endpoints projection event",
+			"endpoints", key,
+			"currentResourceVersion", current.ResourceVersion,
+			"incomingResourceVersion", endpoints.ResourceVersion)
+		return nil
+	}
 	if endpoints.Labels[LabelMeshManaged] != "true" {
 		if !s.managed[key] {
 			return nil
@@ -251,6 +267,41 @@ func (s *Store) ManagedEndpoint(name proxy.ServicePortName) (endpoint string, ma
 	return route.Endpoint(), true, snapshot.SourceState == SourceSynced && route.Phase == PhaseApplied
 }
 
+func (s *Store) repairCandidates() []types.NamespacedName {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.snapshot.Load().(*Snapshot).SourceState != SourceSynced {
+		return nil
+	}
+
+	candidates := make([]types.NamespacedName, 0)
+	seen := make(map[string]bool)
+	for _, route := range s.snapshot.Load().(*Snapshot).Routes {
+		key := route.Key()
+		if seen[key] || route.Phase != PhaseDegraded || !s.managed[key] || s.verified[key] != "" {
+			continue
+		}
+		// A confirmed delete must stay fail-closed; repair only objects that
+		// are still present but currently violate the managed route contract.
+		if s.services[key] == nil || s.endpoints[key] == nil {
+			continue
+		}
+		namespace, name, found := strings.Cut(key, "/")
+		if !found || namespace == "" || name == "" {
+			continue
+		}
+		candidates = append(candidates, types.NamespacedName{Namespace: namespace, Name: name})
+		seen[key] = true
+	}
+	return candidates
+}
+
+func (s *Store) projectionVerified(name types.NamespacedName) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.verified[namespacedKey(name.Namespace, name.Name)] != ""
+}
+
 // MarkPortalPending is called before a managed userspace portal is opened.
 // Recording the identity first makes the data path fail closed even when the
 // proxier handler runs before the meshstate informer handler.
@@ -379,20 +430,24 @@ func (s *Store) publishDegradedServiceLocked(next *Snapshot, service *v1.Service
 	}
 	revision, _ := strconv.ParseInt(service.Labels[LabelDeploymentRevision], 10, 64)
 	route := Route{
-		RuntimeServiceUID:  service.Labels[LabelRuntimeServiceUID],
-		ServiceUID:         service.UID,
-		Namespace:          service.Namespace,
-		ServiceName:        service.Name,
-		LogicalService:     service.Annotations[AnnotationLogicalService],
-		InstallID:          service.Labels[LabelInstallID],
-		DeploymentRevision: revision,
-		RuntimeID:          service.Labels[LabelRuntimeID],
-		Component:          service.Labels[LabelComponent],
-		TargetNode:         service.Annotations[AnnotationTargetNode],
-		FQDN:               fqdn(service.Name, service.Namespace),
-		Phase:              PhaseDegraded,
-		Reason:             reason,
-		UpdatedAt:          time.Now().UTC(),
+		RuntimeServiceUID:      service.Labels[LabelRuntimeServiceUID],
+		ServiceUID:             service.UID,
+		ServiceResourceVersion: service.ResourceVersion,
+		Namespace:              service.Namespace,
+		ServiceName:            service.Name,
+		LogicalService:         service.Annotations[AnnotationLogicalService],
+		InstallID:              service.Labels[LabelInstallID],
+		DeploymentRevision:     revision,
+		RuntimeID:              service.Labels[LabelRuntimeID],
+		Component:              service.Labels[LabelComponent],
+		TargetNode:             service.Annotations[AnnotationTargetNode],
+		FQDN:                   fqdn(service.Name, service.Namespace),
+		Phase:                  PhaseDegraded,
+		Reason:                 reason,
+		UpdatedAt:              time.Now().UTC(),
+	}
+	if endpoints := s.endpoints[key]; endpoints != nil {
+		route.EndpointsResourceVersion = endpoints.ResourceVersion
 	}
 	if len(service.Spec.Ports) == 1 {
 		route.PortName = service.Spec.Ports[0].Name
@@ -500,26 +555,52 @@ func validateRoute(service *v1.Service, endpoints *v1.Endpoints) (Route, error) 
 		return Route{}, fmt.Errorf("deployment-revision must be a positive base-10 int64")
 	}
 	return Route{
-		RuntimeServiceUID:  service.Labels[LabelRuntimeServiceUID],
-		ServiceUID:         service.UID,
-		Namespace:          service.Namespace,
-		ServiceName:        service.Name,
-		LogicalService:     service.Annotations[AnnotationLogicalService],
-		InstallID:          service.Labels[LabelInstallID],
-		DeploymentRevision: revision,
-		RuntimeID:          service.Labels[LabelRuntimeID],
-		Component:          service.Labels[LabelComponent],
-		TargetNode:         targetNode,
-		FQDN:               fqdn(service.Name, service.Namespace),
-		PortName:           servicePort.Name,
-		ServiceIP:          service.Spec.ClusterIP,
-		ServicePort:        servicePort.Port,
-		EndpointIP:         address.IP,
-		EndpointPort:       endpointPort.Port,
-		EndpointPod:        address.TargetRef.Name,
-		EndpointPodUID:     address.TargetRef.UID,
-		Protocol:           v1.ProtocolTCP,
+		RuntimeServiceUID:        service.Labels[LabelRuntimeServiceUID],
+		ServiceUID:               service.UID,
+		ServiceResourceVersion:   service.ResourceVersion,
+		EndpointsResourceVersion: endpoints.ResourceVersion,
+		Namespace:                service.Namespace,
+		ServiceName:              service.Name,
+		LogicalService:           service.Annotations[AnnotationLogicalService],
+		InstallID:                service.Labels[LabelInstallID],
+		DeploymentRevision:       revision,
+		RuntimeID:                service.Labels[LabelRuntimeID],
+		Component:                service.Labels[LabelComponent],
+		TargetNode:               targetNode,
+		FQDN:                     fqdn(service.Name, service.Namespace),
+		PortName:                 servicePort.Name,
+		ServiceIP:                service.Spec.ClusterIP,
+		ServicePort:              servicePort.Port,
+		EndpointIP:               address.IP,
+		EndpointPort:             endpointPort.Port,
+		EndpointPod:              address.TargetRef.Name,
+		EndpointPodUID:           address.TargetRef.UID,
+		Protocol:                 v1.ProtocolTCP,
 	}, nil
+}
+
+func isOlderNumericResourceVersion(current, incoming string) bool {
+	current, currentOK := canonicalNumericResourceVersion(current)
+	incoming, incomingOK := canonicalNumericResourceVersion(incoming)
+	if !currentOK || !incomingOK {
+		return false
+	}
+	if len(current) != len(incoming) {
+		return len(incoming) < len(current)
+	}
+	return incoming < current
+}
+
+func canonicalNumericResourceVersion(version string) (string, bool) {
+	if version == "" || version[0] < '1' || version[0] > '9' {
+		return "", false
+	}
+	for i := 1; i < len(version); i++ {
+		if version[i] < '0' || version[i] > '9' {
+			return "", false
+		}
+	}
+	return version, true
 }
 
 func portalKey(serviceUID types.UID, port string) string {

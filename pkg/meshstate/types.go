@@ -46,29 +46,31 @@ var identityLabels = []string{
 // RuntimeServiceUID is the external stable key; ServiceUID identifies one
 // Kubernetes Service incarnation and is used for stale replay protection.
 type Route struct {
-	RuntimeServiceUID  string      `json:"runtimeServiceUID"`
-	ServiceUID         types.UID   `json:"serviceUID"`
-	Namespace          string      `json:"namespace"`
-	ServiceName        string      `json:"serviceName"`
-	LogicalService     string      `json:"logicalService"`
-	InstallID          string      `json:"installID"`
-	DeploymentRevision int64       `json:"deploymentRevision"`
-	RuntimeID          string      `json:"runtimeID"`
-	Component          string      `json:"component"`
-	TargetNode         string      `json:"targetNode"`
-	FQDN               string      `json:"fqdn"`
-	PortName           string      `json:"portName"`
-	ServiceIP          string      `json:"serviceIP"`
-	ServicePort        int32       `json:"servicePort"`
-	EndpointIP         string      `json:"endpointIP"`
-	EndpointPort       int32       `json:"endpointPort"`
-	EndpointPod        string      `json:"endpointPod"`
-	EndpointPodUID     types.UID   `json:"endpointPodUID"`
-	Protocol           v1.Protocol `json:"protocol"`
-	Phase              string      `json:"phase"`
-	Reason             string      `json:"reason,omitempty"`
-	ProxyApplied       bool        `json:"proxyApplied"`
-	UpdatedAt          time.Time   `json:"updatedAt"`
+	RuntimeServiceUID        string      `json:"runtimeServiceUID"`
+	ServiceUID               types.UID   `json:"serviceUID"`
+	ServiceResourceVersion   string      `json:"serviceResourceVersion"`
+	EndpointsResourceVersion string      `json:"endpointsResourceVersion"`
+	Namespace                string      `json:"namespace"`
+	ServiceName              string      `json:"serviceName"`
+	LogicalService           string      `json:"logicalService"`
+	InstallID                string      `json:"installID"`
+	DeploymentRevision       int64       `json:"deploymentRevision"`
+	RuntimeID                string      `json:"runtimeID"`
+	Component                string      `json:"component"`
+	TargetNode               string      `json:"targetNode"`
+	FQDN                     string      `json:"fqdn"`
+	PortName                 string      `json:"portName"`
+	ServiceIP                string      `json:"serviceIP"`
+	ServicePort              int32       `json:"servicePort"`
+	EndpointIP               string      `json:"endpointIP"`
+	EndpointPort             int32       `json:"endpointPort"`
+	EndpointPod              string      `json:"endpointPod"`
+	EndpointPodUID           types.UID   `json:"endpointPodUID"`
+	Protocol                 v1.Protocol `json:"protocol"`
+	Phase                    string      `json:"phase"`
+	Reason                   string      `json:"reason,omitempty"`
+	ProxyApplied             bool        `json:"proxyApplied"`
+	UpdatedAt                time.Time   `json:"updatedAt"`
 }
 
 func (r Route) Key() string {

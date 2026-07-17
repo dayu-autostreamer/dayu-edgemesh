@@ -257,6 +257,108 @@ func TestLogicalServiceIsOptionalAndEndpointsAnnotationsAreNotRequired(t *testin
 	}
 }
 
+func TestStoreRejectsOutOfOrderProjectionUpdates(t *testing.T) {
+	t.Run("Endpoints", func(t *testing.T) {
+		store := NewStore()
+		service, endpoints := managedObjects("service-a", "runtime-service-a")
+		service.ResourceVersion = "20"
+		endpoints.ResourceVersion = "20"
+		applyManagedRoute(t, store, service, endpoints)
+
+		stale := endpoints.DeepCopy()
+		stale.ResourceVersion = "19"
+		stale.Subsets = nil
+		if err := store.UpsertEndpoints(stale); err != nil {
+			t.Fatalf("upsert stale endpoints: %v", err)
+		}
+		if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
+			t.Fatalf("older Endpoints update replaced applied route: %#v", route)
+		}
+
+		newerInvalid := stale.DeepCopy()
+		newerInvalid.ResourceVersion = "21"
+		if err := store.UpsertEndpoints(newerInvalid); err != nil {
+			t.Fatalf("upsert newer invalid endpoints: %v", err)
+		}
+		if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseDegraded {
+			t.Fatalf("newer invalid Endpoints did not fail closed: %#v", route)
+		}
+
+		recovered := endpoints.DeepCopy()
+		recovered.ResourceVersion = "22"
+		if err := store.UpsertEndpoints(recovered); err != nil {
+			t.Fatalf("recover endpoints: %v", err)
+		}
+		if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
+			t.Fatalf("newer valid Endpoints did not recover route: %#v", route)
+		}
+	})
+
+	t.Run("Service", func(t *testing.T) {
+		store := NewStore()
+		service, endpoints := managedObjects("service-a", "runtime-service-a")
+		service.ResourceVersion = "20"
+		endpoints.ResourceVersion = "20"
+		applyManagedRoute(t, store, service, endpoints)
+
+		stale := service.DeepCopy()
+		stale.ResourceVersion = "19"
+		delete(stale.Annotations, AnnotationTargetNode)
+		if err := store.UpsertService(stale); err != nil {
+			t.Fatalf("upsert stale service: %v", err)
+		}
+		if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseApplied || route.TargetNode != "node-a" {
+			t.Fatalf("older Service update replaced applied route: %#v", route)
+		}
+
+		newerInvalid := stale.DeepCopy()
+		newerInvalid.ResourceVersion = "21"
+		if err := store.UpsertService(newerInvalid); err != nil {
+			t.Fatalf("upsert newer invalid service: %v", err)
+		}
+		if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseDegraded {
+			t.Fatalf("newer invalid Service did not fail closed: %#v", route)
+		}
+
+		recovered := service.DeepCopy()
+		recovered.ResourceVersion = "22"
+		if err := store.UpsertService(recovered); err != nil {
+			t.Fatalf("recover service: %v", err)
+		}
+		if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseApplied || route.TargetNode != "node-a" {
+			t.Fatalf("newer valid Service did not recover route: %#v", route)
+		}
+	})
+}
+
+func TestIsOlderNumericResourceVersion(t *testing.T) {
+	tests := []struct {
+		name     string
+		current  string
+		incoming string
+		want     bool
+	}{
+		{name: "older", current: "20", incoming: "19", want: true},
+		{name: "newer", current: "20", incoming: "21", want: false},
+		{name: "equal", current: "20", incoming: "20", want: false},
+		{name: "arbitrary precision", current: "100000000000000000000000000000000000000", incoming: "99999999999999999999999999999999999999", want: true},
+		{name: "leading zeroes are not canonical", current: "00020", incoming: "0019", want: false},
+		{name: "zero is not an object version", current: "20", incoming: "0", want: false},
+		{name: "empty current", current: "", incoming: "19", want: false},
+		{name: "empty incoming", current: "20", incoming: "", want: false},
+		{name: "opaque current", current: "rv-20", incoming: "19", want: false},
+		{name: "opaque incoming", current: "20", incoming: "rv-19", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isOlderNumericResourceVersion(test.current, test.incoming); got != test.want {
+				t.Fatalf("isOlderNumericResourceVersion(%q, %q) = %t, want %t", test.current, test.incoming, got, test.want)
+			}
+		})
+	}
+}
+
 func TestServiceIncarnationReplacementAndStaleDeletes(t *testing.T) {
 	store := NewStore()
 	oldService, oldEndpoints := managedObjects("service-a", "runtime-service-a")

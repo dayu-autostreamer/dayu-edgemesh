@@ -252,7 +252,7 @@ func (s *Server) Run() error {
 		})
 	}
 	if s.managedRuntime != nil {
-		if err := s.managedRuntime.RegisterInformers(serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
+		if err := s.managedRuntime.RegisterInformers(s.kubeClient, serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
 			return fmt.Errorf("register managed runtime informer handlers: %w", err)
 		}
 		if err := s.managedRuntime.StartStatusServer(); err != nil {

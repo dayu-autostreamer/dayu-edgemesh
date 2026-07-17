@@ -26,6 +26,8 @@ func TestRouteStatusRequiresKnownExactAppliedRoute(t *testing.T) {
 	}
 
 	service, endpoints := managedObjects("service-a", "runtime-service-a")
+	service.ResourceVersion = "20"
+	endpoints.ResourceVersion = "21"
 	if err := store.UpsertService(service); err != nil {
 		t.Fatalf("upsert service: %v", err)
 	}
@@ -43,6 +45,9 @@ func TestRouteStatusRequiresKnownExactAppliedRoute(t *testing.T) {
 	}
 	if status.ServiceUID != "service-a" || status.RuntimeServiceUID != "runtime-service-a" || status.EndpointPodUID != "pod-a" {
 		t.Fatalf("status lost exact identity: %#v", status)
+	}
+	if status.ServiceResourceVersion != "20" || status.EndpointsResourceVersion != "21" {
+		t.Fatalf("status lost observed resource versions: %#v", status)
 	}
 	if status.DeploymentRevision != 7 || status.State != PhaseDegraded || status.SourceState != SourceSyncing || status.LocalSequence == 0 {
 		t.Fatalf("unexpected pre-apply status: %#v", status)

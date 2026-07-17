@@ -93,17 +93,19 @@ func (s *StatusServer) route(w http.ResponseWriter, r *http.Request) {
 		state = PhaseDegraded
 	}
 	response := routeStatusResponse{
-		ServiceUID:         string(route.ServiceUID),
-		RuntimeServiceUID:  route.RuntimeServiceUID,
-		DeploymentRevision: route.DeploymentRevision,
-		RuntimeID:          route.RuntimeID,
-		State:              state,
-		LocalSequence:      snapshot.Sequence,
-		SourceState:        snapshot.SourceState,
-		TargetNode:         route.TargetNode,
-		EndpointPodUID:     string(route.EndpointPodUID),
-		Reason:             route.Reason,
-		ObservedAt:         route.UpdatedAt,
+		ServiceUID:               string(route.ServiceUID),
+		RuntimeServiceUID:        route.RuntimeServiceUID,
+		ServiceResourceVersion:   route.ServiceResourceVersion,
+		EndpointsResourceVersion: route.EndpointsResourceVersion,
+		DeploymentRevision:       route.DeploymentRevision,
+		RuntimeID:                route.RuntimeID,
+		State:                    state,
+		LocalSequence:            snapshot.Sequence,
+		SourceState:              snapshot.SourceState,
+		TargetNode:               route.TargetNode,
+		EndpointPodUID:           string(route.EndpointPodUID),
+		Reason:                   route.Reason,
+		ObservedAt:               route.UpdatedAt,
 	}
 	if snapshot.SourceState != SourceSynced {
 		response.Reason = snapshot.SourceMessage
@@ -116,17 +118,19 @@ func (s *StatusServer) route(w http.ResponseWriter, r *http.Request) {
 }
 
 type routeStatusResponse struct {
-	ServiceUID         string    `json:"serviceUID"`
-	RuntimeServiceUID  string    `json:"runtimeServiceUID"`
-	DeploymentRevision int64     `json:"deploymentRevision"`
-	RuntimeID          string    `json:"runtimeID"`
-	State              string    `json:"state"`
-	LocalSequence      uint64    `json:"localSequence"`
-	SourceState        string    `json:"sourceState"`
-	TargetNode         string    `json:"targetNode"`
-	EndpointPodUID     string    `json:"endpointPodUID"`
-	Reason             string    `json:"reason,omitempty"`
-	ObservedAt         time.Time `json:"observedAt"`
+	ServiceUID               string    `json:"serviceUID"`
+	RuntimeServiceUID        string    `json:"runtimeServiceUID"`
+	ServiceResourceVersion   string    `json:"serviceResourceVersion"`
+	EndpointsResourceVersion string    `json:"endpointsResourceVersion"`
+	DeploymentRevision       int64     `json:"deploymentRevision"`
+	RuntimeID                string    `json:"runtimeID"`
+	State                    string    `json:"state"`
+	LocalSequence            uint64    `json:"localSequence"`
+	SourceState              string    `json:"sourceState"`
+	TargetNode               string    `json:"targetNode"`
+	EndpointPodUID           string    `json:"endpointPodUID"`
+	Reason                   string    `json:"reason,omitempty"`
+	ObservedAt               time.Time `json:"observedAt"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, value interface{}) {
