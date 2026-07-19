@@ -156,20 +156,16 @@ func (s *Server) Run() error {
 	validationServiceInformerFactory := informerFactory
 	validationNamespaceInformerFactory := namespaceInformerFactory
 	validationClient := s.kubeClient
-	if s.managedRuntime == nil {
-		if directValidationClient, source, err := buildValidationClient(s.kubeClient); err == nil {
-			validationClient = directValidationClient
-			validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
-				informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-					options.LabelSelector = labelSelector.String()
-				}))
-			validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
-			klog.InfoS("Using independent Kubernetes API validation source for EdgeMesh proxy state", "source", source)
-		} else {
-			klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", err)
-		}
+	if directValidationClient, source, err := buildValidationClient(s.kubeClient); err == nil {
+		validationClient = directValidationClient
+		validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
+			informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+				options.LabelSelector = labelSelector.String()
+			}))
+		validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
+		klog.InfoS("Using independent Kubernetes API source for legacy EdgeMesh proxy recovery", "source", source)
 	} else {
-		klog.Info("Managed runtime enabled: reusing the primary MetaServer informer cache and disabling independent Kubernetes API validation")
+		klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", err)
 	}
 	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
 	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
@@ -259,14 +255,49 @@ func (s *Server) Run() error {
 			return fmt.Errorf("start managed runtime status server: %w", err)
 		}
 	}
-	serviceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
-	serviceConfig.RegisterEventHandler(s.Proxier)
-	go serviceConfig.Run(wait.NeverStop)
+	if hasIndependentValidation && s.managedRuntime != nil {
+		// Managed objects and readiness remain on the primary MetaServer
+		// informers. The independent source owns only legacy events, restoring
+		// their recovery path without feeding cloud objects into managed state.
+		managedServiceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
+		managedServiceConfig.RegisterEventHandler(&classifiedServiceHandler{
+			handler:  s.Proxier,
+			managed:  true,
+			onSynced: s.Proxier.OnServiceSynced,
+		})
+		legacyServiceConfig := config.NewServiceConfig(validationServiceInformer, s.ConfigSyncPeriod)
+		legacyServiceConfig.RegisterEventHandler(&classifiedServiceHandler{
+			handler: s.Proxier,
+			managed: false,
+		})
+		go managedServiceConfig.Run(wait.NeverStop)
+		go legacyServiceConfig.Run(wait.NeverStop)
 
-	if endpointsHandler, ok := s.Proxier.(config.EndpointsHandler); ok {
-		endpointsConfig := config.NewEndpointsConfig(endpointsInformer, s.ConfigSyncPeriod)
-		endpointsConfig.RegisterEventHandler(endpointsHandler)
-		go endpointsConfig.Run(wait.NeverStop)
+		if endpointsHandler, ok := s.Proxier.(config.EndpointsHandler); ok {
+			managedEndpointsConfig := config.NewEndpointsConfig(endpointsInformer, s.ConfigSyncPeriod)
+			managedEndpointsConfig.RegisterEventHandler(&classifiedEndpointsHandler{
+				handler:  endpointsHandler,
+				managed:  true,
+				onSynced: endpointsHandler.OnEndpointsSynced,
+			})
+			legacyEndpointsConfig := config.NewEndpointsConfig(validationServiceInformerFactory.Core().V1().Endpoints(), s.ConfigSyncPeriod)
+			legacyEndpointsConfig.RegisterEventHandler(&classifiedEndpointsHandler{
+				handler: endpointsHandler,
+				managed: false,
+			})
+			go managedEndpointsConfig.Run(wait.NeverStop)
+			go legacyEndpointsConfig.Run(wait.NeverStop)
+		}
+	} else {
+		serviceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
+		serviceConfig.RegisterEventHandler(s.Proxier)
+		go serviceConfig.Run(wait.NeverStop)
+
+		if endpointsHandler, ok := s.Proxier.(config.EndpointsHandler); ok {
+			endpointsConfig := config.NewEndpointsConfig(endpointsInformer, s.ConfigSyncPeriod)
+			endpointsConfig.RegisterEventHandler(endpointsHandler)
+			go endpointsConfig.Run(wait.NeverStop)
+		}
 	}
 	// This has to start after the calls to NewServiceConfig and NewEndpointsConfig because those
 	// functions must configure their shared informer event handlers first.

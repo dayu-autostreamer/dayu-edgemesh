@@ -118,6 +118,63 @@ func TestSyncProxyRulesReleasesDeletedNodePortBeforeReusingIt(t *testing.T) {
 	}
 }
 
+func TestStaleTeardownPreservesReplacementNodePortOwner(t *testing.T) {
+	fakeIPT := newFakeIPTables()
+	proxier, err := createProxier(
+		&fakeLoadBalancer{},
+		net.ParseIP("169.254.20.10"),
+		fakeIPT,
+		nil,
+		net.ParseIP("169.254.20.10"),
+		newPortAllocator(utilnet.PortRange{}),
+		time.Second,
+		time.Second,
+		time.Second,
+		newFakeProxySocket,
+	)
+	if err != nil {
+		t.Fatalf("create proxier: %v", err)
+	}
+
+	staleService := testService("shy-dayu", "scheduler-cloud", "tcp-0", "10.0.0.10", 80, 32701)
+	if ports := proxier.mergeService(staleService, nil); ports.Len() != 1 {
+		t.Fatalf("expected stale service to expose 1 port, got %d", ports.Len())
+	}
+	staleName := proxy.ServicePortName{
+		NamespacedName: types.NamespacedName{Namespace: staleService.Namespace, Name: staleService.Name},
+		Port:           staleService.Spec.Ports[0].Name,
+	}
+	staleInfo := proxier.serviceMap[staleName]
+	if staleInfo == nil {
+		t.Fatal("stale service was not installed")
+	}
+
+	key := portMapKey{ip: net.IP(nil).String(), port: 32701, protocol: v1.ProtocolTCP}
+	replacementName := proxy.ServicePortName{
+		NamespacedName: types.NamespacedName{Namespace: "dayu", Name: "processor-vehicle-detection"},
+		Port:           "tcp-0",
+	}
+	replacementSocket := &fakeProxySocket{addr: &net.TCPAddr{IP: net.IPv4zero, Port: key.port}, port: key.port}
+	proxier.portMap[key] = &portMapValue{owner: replacementName, socket: replacementSocket}
+
+	if err := proxier.cleanupPortalAndProxy(staleName, staleInfo, true); err != nil {
+		t.Fatalf("stale teardown failed after NodePort ownership moved: %v", err)
+	}
+	claim, found := proxier.portMap[key]
+	if !found || claim.owner != replacementName {
+		t.Fatalf("replacement NodePort claim = %#v, want owner %v", claim, replacementName)
+	}
+	if replacementSocket.closed.Load() {
+		t.Fatal("stale teardown closed the replacement owner's NodePort socket")
+	}
+	if _, found := proxier.serviceMap[staleName]; found {
+		t.Fatal("stale service remained in proxier state after successful teardown")
+	}
+	if staleInfo.teardownPending || !staleInfo.portalClosed || !staleInfo.socketClosed {
+		t.Fatalf("stale teardown state was not committed: %#v", staleInfo)
+	}
+}
+
 func TestSyncProxyRulesCleansServiceMissingFromCurrentState(t *testing.T) {
 	fakeIPT := newFakeIPTables()
 	proxier, err := createProxier(

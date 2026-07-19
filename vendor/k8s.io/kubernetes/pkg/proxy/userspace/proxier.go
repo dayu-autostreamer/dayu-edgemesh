@@ -1186,8 +1186,10 @@ func (proxier *Proxier) claimNodePort(ip net.IP, port int, protocol v1.Protocol,
 	return fmt.Errorf("Port conflict detected on port %s.  %v vs %v", key.String(), owner, existing)
 }
 
-// Release a claim on a port.  Returns an error if the owner does not match the claim.
-// Tolerates release on an unclaimed port, to simplify .
+// Release a claim on a port. A teardown can be retried after the port has
+// already been transferred to another Service. In that case the old owner has
+// nothing left to release; the replacement's claim and socket must be kept.
+// Tolerates release on an unclaimed port for the same reason.
 func (proxier *Proxier) releaseNodePort(ip net.IP, port int, protocol v1.Protocol, owner proxy.ServicePortName) error {
 	proxier.portMapMutex.Lock()
 	defer proxier.portMapMutex.Unlock()
@@ -1200,7 +1202,11 @@ func (proxier *Proxier) releaseNodePort(ip net.IP, port int, protocol v1.Protoco
 		return nil
 	}
 	if existing.owner != owner {
-		return fmt.Errorf("Port conflict detected on port %v (unowned unlock).  %v vs %v", key, owner, existing)
+		klog.V(2).InfoS("Skipping release of NodePort now owned by another service",
+			"port", key,
+			"staleOwner", owner,
+			"currentOwner", existing.owner)
+		return nil
 	}
 	delete(proxier.portMap, key)
 	existing.socket.Close()

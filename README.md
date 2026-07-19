@@ -43,17 +43,24 @@ Falling back to primary Kubernetes client for EdgeMesh proxy validation
 
 If direct validation is enabled successfully, `edgemesh-agent` will log:
 ```text
-Using independent Kubernetes API validation source for EdgeMesh proxy state
+Using independent Kubernetes API source for legacy EdgeMesh proxy recovery
 ```
+
+When managed runtime is enabled, this independent source owns only unlabelled
+legacy Service and Endpoints events. Managed objects remain exclusively on the
+primary MetaServer informer path. A stale teardown that finds its NodePort
+already owned by a replacement Service preserves the replacement claim and
+finishes removing only the stale proxy state.
 
 ### RuntimeService Data Path
 
 Dayu-Edgemesh now includes a revision-scoped data path for Sedna
 `RuntimeService` workloads. It replaces per-runtime Kubernetes discovery with
 one local, in-memory projection built from EdgeProxy's existing Service and
-Endpoints informers. No extra watch, Kubernetes client, hosts file, or
-persistent cache is introduced on an edge node. A bounded point-lookup repair
-uses the same MetaServer client only while a managed projection is invalid.
+Endpoints informers. The managed projection adds no watch, Kubernetes client,
+hosts file, or persistent cache. A bounded point-lookup repair uses the same
+MetaServer client only while a managed projection is invalid. The independent
+Kubernetes source described above is isolated to legacy routing recovery.
 
 Dayu EdgeMesh enables this path by default for Dayu v1.4:
 
@@ -84,10 +91,13 @@ The gate adds exact routing only for ClusterIP Services labelled
 `dayu.io/mesh-managed=true`; unlabelled Services retain legacy proxy behavior.
 This allows one v1.1 agent on each node to serve Dayu v1.3 JMES/NodePort traffic
 and Dayu v1.4 RuntimeService traffic in different namespaces at the same time.
-Both managed and legacy Services use the primary
-MetaServer-backed informer as their validation source, avoiding a second
-cloud API request path on edge nodes. Set the gate to `false` only when rolling
-back to the exact pre-managed validation behavior.
+Managed Services continue to use only the primary MetaServer-backed informer.
+When direct Kubernetes API access is available, unlabelled legacy Services and
+Endpoints use the independent source for prompt recovery from a missed or stale
+MetaServer event; otherwise they fall back to the primary informer. The two
+event streams are label-disjoint, and a label transition is handed over as one
+atomic update. Set the gate to `false` only when rolling back to the exact
+pre-managed validation behavior.
 
 A managed route becomes selectable only after all of the following agree on
 the same revision and Kubernetes object incarnation:

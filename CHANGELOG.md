@@ -48,6 +48,14 @@ Kubernetes API versions remain unchanged.
   routing.
 - Exposed the observed Service and Endpoints resource versions in the local
   route status response for cache-path diagnosis.
+- Restored the independent Kubernetes Service/Endpoints event source for
+  unlabelled legacy traffic while managed runtime is enabled, with strict
+  label-based ownership and primary-only readiness for managed routes. This
+  prevents a missed MetaServer watch event from delaying a Dayu v1.3 NodePort
+  until the 15-minute informer resync without changing Dayu v1.4 routing.
+- Made stale NodePort teardown tolerate a claim already transferred to another
+  Service. The replacement claim and socket are preserved while the obsolete
+  proxy state is committed as removed instead of retrying indefinitely.
 
 ### Compatibility
 

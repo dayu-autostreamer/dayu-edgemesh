@@ -11,9 +11,10 @@ The design has three hard boundaries:
 
 1. It is label-isolated. Existing `JointMultiEdgeService`, NodePort, and
    unlabelled Service behavior is preserved while the feature is enabled.
-2. It reuses the primary informer and MetaServer client. No second Kubernetes
-   client, watch, periodic list, hosts file, or EdgeMesh checkpoint is added.
-   A bounded point lookup runs only for invalid managed projections.
+2. The managed projection reuses only the primary informer and MetaServer
+   client. It adds no second Kubernetes source, hosts file, or EdgeMesh
+   checkpoint. A bounded point lookup runs only for invalid managed
+   projections. The legacy path may retain its independent Kubernetes source.
 3. It is fail-closed. An incomplete or ambiguous managed route never enters
    the legacy/random load-balancer path.
 
@@ -27,10 +28,10 @@ The feature gate is under `modules.edgeProxy.managedRuntime.enable` and defaults
 to `true` in the Dayu v1.1 distribution so Dayu v1.4 works without a deployment
 override.
 
-| Gate | Managed Service | Legacy Service / JMES / NodePort | Validation source |
+| Gate | Managed Service | Legacy Service / JMES / NodePort | Event and validation sources |
 |---|---|---|---|
-| `false` | Not interpreted | Existing behavior | Existing independent validation with fallback |
-| `true` | Exact managed route, fail-closed | Existing proxy semantics | Primary MetaServer-backed informer |
+| `false` | Not interpreted | Existing behavior | Independent Kubernetes source when available, primary fallback |
+| `true` | Exact managed route, fail-closed | Existing proxy semantics | Managed: primary MetaServer informer only; legacy: independent Kubernetes source when available, primary fallback |
 
 Enabling managed runtime requires EdgeProxy to be enabled and
 `serviceFilterMode: FilterIfLabelExists`. Configuration validation rejects any
@@ -56,9 +57,14 @@ One v1.1 EdgeMesh agent per node can serve both generations concurrently:
 
 Do not run a second EdgeMesh agent on the same node. Both agents would own the
 same host-network proxy/iptables state and compete for `127.0.0.1:10551`.
-With the gate enabled, legacy validation also reuses the primary MetaServer
-informer cache; routing semantics remain legacy, but stale-object validation is
-no longer sourced from a separate cloud API client.
+With the gate enabled, the primary MetaServer informer remains authoritative
+only for labelled managed objects. If direct Kubernetes API access is
+available, a separate informer owns only unlabelled legacy Service/Endpoints
+events; otherwise legacy events fall back to the primary informer. This
+restores prompt v1.3 NodePort reconciliation without changing the v1.4 managed
+route source or its fail-closed contract. Label transitions are forwarded once
+by the destination source as an atomic update, so the streams never
+independently delete and add the same Service.
 
 ## Data and acknowledgement flow
 
@@ -164,10 +170,12 @@ Service and Endpoints and can recover the route without a second cloud client.
 The returned objects must still pass the exact contract and proxy
 acknowledgement, so the path remains fail-closed.
 
-The repair cannot manufacture freshness when MetaServer's point GET is also
-unavailable or stale. In that source-level failure mode the route remains
+The managed repair cannot manufacture freshness when MetaServer's point GET is
+also unavailable or stale. In that source-level failure mode the route remains
 `DEGRADED`; the KubeEdge metadata path must be repaired. EdgeMesh deliberately
-does not bypass MetaServer with a direct cloud API client.
+does not bypass MetaServer with a direct cloud API client for managed routing.
+The independent client, when available, is consumed only by unlabelled legacy
+Service/Endpoints reconciliation and stale-object validation.
 
 The proxy's `PENDING` and `REMOVING` lifecycle events force the route out of
 `APPLIED`; `REMOVED` alone may release the tombstone. These transitions cannot
