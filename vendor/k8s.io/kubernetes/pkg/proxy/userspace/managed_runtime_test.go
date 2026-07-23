@@ -10,6 +10,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/kubernetes/pkg/proxy"
 )
 
@@ -381,10 +382,10 @@ func TestDeletePromotesPendingReplacementToFinalTeardown(t *testing.T) {
 	}
 }
 
-func TestManagedServiceBypassesIndependentLegacyExistenceValidation(t *testing.T) {
+func TestManagedServiceRequiresExactIncarnationValidation(t *testing.T) {
 	proxier := &Proxier{}
-	proxier.SetNamespaceExistsHandler(func(string) bool { return false })
-	proxier.SetServiceExistsHandler(func(proxy.ServicePortName) bool { return false })
+	proxier.SetNamespaceExistsHandler(func(string) bool { return true })
+	proxier.SetServiceExistsHandler(func(proxy.ServicePortName) bool { return true })
 	proxier.SetManagedServiceHandler(func(service *v1.Service) bool {
 		return service.Labels["dayu.io/mesh-managed"] == "true"
 	})
@@ -392,17 +393,58 @@ func TestManagedServiceBypassesIndependentLegacyExistenceValidation(t *testing.T
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "default",
 			Name:      "runtime-a",
+			UID:       "service-a",
 			Labels:    map[string]string{"dayu.io/mesh-managed": "true"},
 		},
 		Spec: v1.ServiceSpec{ClusterIP: "10.96.0.42", Ports: []v1.ServicePort{{Name: "runtime", Port: 8080}}},
 	}
-	if ports := proxier.currentServicePortNames(service); !ports.Has("runtime") {
-		t.Fatal("managed Service was incorrectly rejected by independent legacy validation")
+	proxier.SetServiceUIDExistsHandler(func(proxy.ServicePortName, types.UID) bool { return false })
+	if ports := proxier.currentServicePortNames(service); ports.Has("runtime") {
+		t.Fatal("stale managed Service incarnation bypassed exact validation")
 	}
-	legacy := service.DeepCopy()
-	delete(legacy.Labels, "dayu.io/mesh-managed")
-	if ports := proxier.currentServicePortNames(legacy); ports.Has("runtime") {
-		t.Fatal("legacy Service unexpectedly bypassed independent validation")
+	proxier.SetServiceUIDExistsHandler(func(_ proxy.ServicePortName, uid types.UID) bool {
+		return uid == service.UID
+	})
+	if ports := proxier.currentServicePortNames(service); !ports.Has("runtime") {
+		t.Fatal("current managed Service incarnation was rejected")
+	}
+}
+
+func TestCleanupRemovesOrphanedManagedServiceIncarnation(t *testing.T) {
+	fakeIPT := newFakeIPTables()
+	proxier, err := createProxier(
+		&fakeLoadBalancer{},
+		net.ParseIP("169.254.20.10"),
+		fakeIPT,
+		nil,
+		net.ParseIP("169.254.20.10"),
+		newPortAllocator(utilnet.PortRange{}),
+		time.Second,
+		time.Second,
+		time.Second,
+		newFakeProxySocket,
+	)
+	if err != nil {
+		t.Fatalf("create proxier: %v", err)
+	}
+	service := testService("dayu", "runtime-a", "runtime", "10.96.0.42", 8080, 0)
+	service.UID = "service-a"
+	service.Labels = map[string]string{"dayu.io/mesh-managed": "true"}
+	name := proxy.ServicePortName{
+		NamespacedName: types.NamespacedName{Namespace: service.Namespace, Name: service.Name},
+		Port:           "runtime",
+	}
+	proxier.SetManagedServiceHandler(func(service *v1.Service) bool {
+		return service.Labels["dayu.io/mesh-managed"] == "true"
+	})
+	proxier.mergeService(service, nil)
+	if _, exists := proxier.serviceMap[name]; !exists {
+		t.Fatal("managed Service was not installed")
+	}
+	proxier.SetServiceUIDExistsHandler(func(proxy.ServicePortName, types.UID) bool { return false })
+	proxier.cleanupOrphanedServices()
+	if _, exists := proxier.serviceMap[name]; exists {
+		t.Fatal("orphaned managed Service retained its portal and proxy socket")
 	}
 }
 

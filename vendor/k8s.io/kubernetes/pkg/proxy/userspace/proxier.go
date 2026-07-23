@@ -144,6 +144,7 @@ type serviceChangeEntry struct {
 
 type NamespaceExistsFunc func(namespace string) bool
 type ServiceExistsFunc func(service proxy.ServicePortName) bool
+type ServiceUIDExistsFunc func(service proxy.ServicePortName, uid types.UID) bool
 type ManagedServiceFunc func(service *v1.Service) bool
 type ServicePendingFunc func(service proxy.ServicePortName, serviceUID types.UID)
 type ServiceAppliedFunc func(service proxy.ServicePortName, serviceUID types.UID, applied bool)
@@ -163,27 +164,28 @@ type Proxier struct {
 	// TODO(imroc): implement node handler for userspace proxier.
 	config.NoopNodeHandler
 
-	loadBalancer    LoadBalancer
-	mu              sync.Mutex // protects serviceMap
-	serviceMap      map[proxy.ServicePortName]*ServiceInfo
-	syncPeriod      time.Duration
-	minSyncPeriod   time.Duration
-	udpIdleTimeout  time.Duration
-	portMapMutex    sync.Mutex
-	portMap         map[portMapKey]*portMapValue
-	listenIP        net.IP
-	iptables        iptables.Interface
-	hostIP          net.IP
-	localAddrs      netutils.IPSet
-	proxyPorts      PortAllocator
-	makeProxySocket ProxySocketFunc
-	exec            utilexec.Interface
-	namespaceExists NamespaceExistsFunc
-	serviceExists   ServiceExistsFunc
-	managedService  ManagedServiceFunc
-	servicePending  ServicePendingFunc
-	serviceApplied  ServiceAppliedFunc
-	serviceRemoved  ServiceRemovedFunc
+	loadBalancer     LoadBalancer
+	mu               sync.Mutex // protects serviceMap
+	serviceMap       map[proxy.ServicePortName]*ServiceInfo
+	syncPeriod       time.Duration
+	minSyncPeriod    time.Duration
+	udpIdleTimeout   time.Duration
+	portMapMutex     sync.Mutex
+	portMap          map[portMapKey]*portMapValue
+	listenIP         net.IP
+	iptables         iptables.Interface
+	hostIP           net.IP
+	localAddrs       netutils.IPSet
+	proxyPorts       PortAllocator
+	makeProxySocket  ProxySocketFunc
+	exec             utilexec.Interface
+	namespaceExists  NamespaceExistsFunc
+	serviceExists    ServiceExistsFunc
+	serviceUIDExists ServiceUIDExistsFunc
+	managedService   ManagedServiceFunc
+	servicePending   ServicePendingFunc
+	serviceApplied   ServiceAppliedFunc
+	serviceRemoved   ServiceRemovedFunc
 	// endpointsSynced and servicesSynced are set to 1 when the corresponding
 	// objects are synced after startup. This is used to avoid updating iptables
 	// with some partial data after kube-proxy restart.
@@ -425,6 +427,12 @@ func (proxier *Proxier) syncProxyRules() {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 
+	// Remove portals whose exact Service incarnation has disappeared before
+	// opening portals for new Services. Kubernetes may immediately reuse a
+	// deleted ClusterIP; leaving the stale iptables rule first in the chain
+	// would redirect the new Service to the old proxy socket.
+	proxier.cleanupOrphanedServices()
+
 	klog.V(4).InfoS("userspace proxy: processing service events", "count", len(changes))
 	for _, entry := range orderedServiceChanges(changes) {
 		existingPorts := proxier.currentServicePortNames(entry.change.current)
@@ -501,6 +509,15 @@ func (proxier *Proxier) SetServiceExistsHandler(handler ServiceExistsFunc) {
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
 	proxier.serviceExists = handler
+}
+
+// SetServiceUIDExistsHandler validates the exact Service incarnation behind a
+// managed portal. A name-only existence check cannot detect a missed delete
+// followed by a same-name replacement.
+func (proxier *Proxier) SetServiceUIDExistsHandler(handler ServiceUIDExistsFunc) {
+	proxier.mu.Lock()
+	defer proxier.mu.Unlock()
+	proxier.serviceUIDExists = handler
 }
 
 // SetManagedServiceHandler identifies the opt-in data path directly from the
@@ -660,7 +677,11 @@ func (proxier *Proxier) currentServicePortNames(service *v1.Service) sets.String
 			NamespacedName: types.NamespacedName{Namespace: service.Namespace, Name: service.Name},
 			Port:           servicePort.Name,
 		}
-		if managed || proxier.serviceStillExists(serviceName) {
+		exists := proxier.serviceIncarnationStillExists(serviceName, service.UID)
+		if !managed {
+			exists = proxier.serviceStillExists(serviceName)
+		}
+		if exists {
 			existingPorts.Insert(servicePort.Name)
 		} else {
 			klog.InfoS("Skipping stale service port from current state", "servicePortName", serviceName)
@@ -679,6 +700,13 @@ func (proxier *Proxier) serviceStillExists(serviceName proxy.ServicePortName) bo
 	return true
 }
 
+func (proxier *Proxier) serviceIncarnationStillExists(serviceName proxy.ServicePortName, uid types.UID) bool {
+	if proxier.serviceUIDExists != nil {
+		return proxier.serviceUIDExists(serviceName, uid)
+	}
+	return proxier.serviceStillExists(serviceName)
+}
+
 func (proxier *Proxier) cleanupOrphanedServices() {
 	staleUDPServices := sets.NewString()
 	for serviceName, info := range proxier.serviceMap {
@@ -692,7 +720,11 @@ func (proxier *Proxier) cleanupOrphanedServices() {
 			info.setFinished()
 			continue
 		}
-		if info.managed || proxier.serviceStillExists(serviceName) {
+		exists := proxier.serviceIncarnationStillExists(serviceName, info.serviceUID)
+		if !info.managed {
+			exists = proxier.serviceStillExists(serviceName)
+		}
+		if exists {
 			continue
 		}
 

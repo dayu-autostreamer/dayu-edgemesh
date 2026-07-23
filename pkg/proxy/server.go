@@ -246,6 +246,49 @@ func (s *Server) Run() error {
 			}
 			return false
 		})
+		userspaceProxier.SetServiceUIDExistsHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID) bool {
+			if validationServiceInformer.Informer().HasSynced() {
+				service, err := validationServiceInformer.Lister().Services(servicePort.NamespacedName.Namespace).Get(servicePort.NamespacedName.Name)
+				if err == nil {
+					if service.UID != serviceUID {
+						return false
+					}
+					for i := range service.Spec.Ports {
+						if service.Spec.Ports[i].Name == servicePort.Port {
+							return true
+						}
+					}
+					return false
+				}
+			}
+			if !hasIndependentValidation {
+				// Without an independent source, the managed event itself is
+				// the best available identity. Fail open until its primary
+				// informer catches up rather than dropping a new portal.
+				return true
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			service, err := validationClient.CoreV1().Services(servicePort.NamespacedName.Namespace).Get(ctx, servicePort.NamespacedName.Name, metav1.GetOptions{})
+			switch {
+			case err == nil:
+			case apierrors.IsNotFound(err):
+				return false
+			default:
+				klog.V(2).InfoS("Service incarnation validation lookup failed, falling back to trusting primary source",
+					"servicePortName", servicePort, "serviceUID", serviceUID, "err", err)
+				return true
+			}
+			if service.UID != serviceUID {
+				return false
+			}
+			for i := range service.Spec.Ports {
+				if service.Spec.Ports[i].Name == servicePort.Port {
+					return true
+				}
+			}
+			return false
+		})
 	}
 	if s.managedRuntime != nil {
 		if err := s.managedRuntime.RegisterInformers(s.kubeClient, serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
