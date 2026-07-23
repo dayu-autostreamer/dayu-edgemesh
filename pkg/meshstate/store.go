@@ -33,6 +33,7 @@ type Store struct {
 	verified      map[string]string // namespaced Service key -> current Service UID
 
 	managedHostsPath string
+	projectionError  string
 	snapshot         atomic.Value // *Snapshot
 }
 
@@ -292,7 +293,8 @@ func (s *Store) ManagedEndpoint(name proxy.ServicePortName) (endpoint string, ma
 func (s *Store) repairCandidates() []types.NamespacedName {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.snapshot.Load().(*Snapshot).SourceState != SourceSynced {
+	projectionFailed := s.projectionError != ""
+	if !projectionFailed && s.snapshot.Load().(*Snapshot).SourceState != SourceSynced {
 		return nil
 	}
 
@@ -300,7 +302,10 @@ func (s *Store) repairCandidates() []types.NamespacedName {
 	seen := make(map[string]bool)
 	for _, route := range s.snapshot.Load().(*Snapshot).Routes {
 		key := route.Key()
-		if seen[key] || route.Phase != PhaseDegraded || !s.managed[key] || s.verified[key] != "" {
+		if seen[key] || !s.managed[key] {
+			continue
+		}
+		if !projectionFailed && (route.Phase != PhaseDegraded || s.verified[key] != "") {
 			continue
 		}
 		// A confirmed delete must stay fail-closed; repair only objects that
@@ -670,13 +675,34 @@ func (s *Store) publishLocked(next *Snapshot) {
 	}
 	next.Sequence++
 	next.UpdatedAt = time.Now().UTC()
-	s.snapshot.Store(next)
+	if s.projectionError != "" {
+		next.SourceState = SourceSynced
+		next.SourceMessage = "Service, Endpoints and managed DNS projection synced"
+		for runtimeUID, route := range next.Routes {
+			if s.routeAppliedLocked(route) {
+				route.ProxyApplied = true
+				route.Phase = PhaseApplied
+				route.Reason = ""
+			} else if s.verified[route.Key()] == string(route.ServiceUID) {
+				route.ProxyApplied = false
+				route.Phase = PhaseReady
+				route.Reason = "waiting for userspace portal"
+			}
+			next.Routes[runtimeUID] = route
+		}
+	}
 	if err := writeManagedHostsFile(s.managedHostsPath, next); err != nil {
-		// Sedna verifies the exact FQDN against ServiceIP before activation, so
-		// a failed publication cannot silently become a Ready RuntimeService.
+		s.projectionError = err.Error()
+		failed := cloneSnapshot(next)
+		failed.SourceState = SourceDegraded
+		failed.SourceMessage = "managed runtime DNS projection failed: " + err.Error()
+		s.snapshot.Store(failed)
 		klog.ErrorS(err, "Publish managed runtime DNS projection",
 			"path", s.managedHostsPath, "sequence", next.Sequence)
+		return
 	}
+	s.projectionError = ""
+	s.snapshot.Store(next)
 }
 
 func writeManagedHostsFile(path string, snapshot *Snapshot) error {
