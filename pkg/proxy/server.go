@@ -295,10 +295,11 @@ func (s *Server) Run() error {
 		// independent API client for discovery and point repair. Replaying a
 		// missing authoritative object through the proxier closes the case
 		// where both managed consumers missed the original Add event.
+		endpointsHandler, _ := s.Proxier.(config.EndpointsHandler)
 		repairProxy := func(service *v1.Service, endpoints *v1.Endpoints) {
 			s.Proxier.OnServiceAdd(service)
-			if endpoints != nil {
-				s.Proxier.OnEndpointsAdd(endpoints)
+			if endpoints != nil && endpointsHandler != nil {
+				endpointsHandler.OnEndpointsAdd(endpoints)
 			}
 		}
 		if err := s.managedRuntime.RegisterInformers(
