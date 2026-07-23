@@ -292,9 +292,22 @@ func (s *Server) Run() error {
 	}
 	if s.managedRuntime != nil {
 		// Keep event delivery on the edge MetaServer informers, but use the
-		// independent API client for point repair. This allows managed state to
-		// retire objects whose delete event was missed by the edge cache.
-		if err := s.managedRuntime.RegisterInformers(validationClient, serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
+		// independent API client for discovery and point repair. Replaying a
+		// missing authoritative object through the proxier closes the case
+		// where both managed consumers missed the original Add event.
+		repairProxy := func(service *v1.Service, endpoints *v1.Endpoints) {
+			s.Proxier.OnServiceAdd(service)
+			if endpoints != nil {
+				s.Proxier.OnEndpointsAdd(endpoints)
+			}
+		}
+		if err := s.managedRuntime.RegisterInformers(
+			validationClient,
+			serviceInformer.Informer(),
+			endpointsInformer.Informer(),
+			repairProxy,
+			wait.NeverStop,
+		); err != nil {
 			return fmt.Errorf("register managed runtime informer handlers: %w", err)
 		}
 		if err := s.managedRuntime.StartStatusServer(); err != nil {

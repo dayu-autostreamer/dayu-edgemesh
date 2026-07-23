@@ -1,6 +1,7 @@
 package meshstate
 
 import (
+	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
@@ -47,9 +48,14 @@ func (r *Runtime) Close() error {
 	return r.status.Close()
 }
 
-func (r *Runtime) RegisterInformers(repairClient clientset.Interface, serviceInformer, endpointsInformer cache.SharedIndexInformer, stopCh <-chan struct{}) error {
+func (r *Runtime) RegisterInformers(
+	repairClient clientset.Interface,
+	serviceInformer, endpointsInformer cache.SharedIndexInformer,
+	repairProxy func(service *v1.Service, endpoints *v1.Endpoints),
+	stopCh <-chan struct{},
+) error {
 	if r == nil {
 		return nil
 	}
-	return r.controller.Register(repairClient, serviceInformer, endpointsInformer, stopCh)
+	return r.controller.Register(repairClient, serviceInformer, endpointsInformer, repairProxy, stopCh)
 }

@@ -12,9 +12,21 @@ import (
 type fakeManagedObjectGetter struct {
 	service      *v1.Service
 	endpoints    *v1.Endpoints
+	serviceList  *v1.ServiceList
+	listErr      error
 	serviceErr   error
 	endpointsErr error
 	calls        []string
+}
+
+func (f *fakeManagedObjectGetter) ListManagedServices(_ context.Context) (*v1.ServiceList, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.serviceList == nil {
+		return &v1.ServiceList{}, nil
+	}
+	return f.serviceList.DeepCopy(), nil
 }
 
 func (f *fakeManagedObjectGetter) GetService(_ context.Context, namespace, name string) (*v1.Service, error) {
@@ -123,6 +135,37 @@ func TestControllerRecoversManagedPortalWithCompletelyMissingProjection(t *testi
 		client.calls[0] != wantCalls[0] ||
 		client.calls[1] != wantCalls[1] {
 		t.Fatalf("repair calls = %#v, want %#v", client.calls, wantCalls)
+	}
+}
+
+func TestControllerDiscoversServiceMissedByBothManagedConsumers(t *testing.T) {
+	store := NewStore()
+	service, endpoints := managedObjects("service-a", "runtime-service-a")
+	service.ResourceVersion = "20"
+	endpoints.ResourceVersion = "20"
+	store.MarkSourceSynced()
+
+	client := &fakeManagedObjectGetter{
+		serviceList: &v1.ServiceList{Items: []v1.Service{*service.DeepCopy()}},
+		endpoints:   endpoints.DeepCopy(),
+	}
+	controller := NewController(store)
+	controller.repairProxy = func(recoveredService *v1.Service, recoveredEndpoints *v1.Endpoints) {
+		if recoveredService.UID != service.UID || recoveredEndpoints == nil || recoveredEndpoints.UID != endpoints.UID {
+			t.Fatalf("proxy repair received wrong objects: service=%#v endpoints=%#v", recoveredService, recoveredEndpoints)
+		}
+		store.MarkPortalPending(recoveredService.UID, servicePortName(recoveredService))
+		store.MarkPortalApplied(recoveredService.UID, servicePortName(recoveredService), true)
+	}
+	controller.repairManagedObjects(client)
+
+	route := requireRoute(t, store, "runtime-service-a")
+	if route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
+		t.Fatalf("authoritative discovery did not recover fully missed route: %#v", route)
+	}
+	wantCalls := []string{"endpoints/default/runtime-a"}
+	if len(client.calls) != len(wantCalls) || client.calls[0] != wantCalls[0] {
+		t.Fatalf("discovery calls = %#v, want %#v", client.calls, wantCalls)
 	}
 }
 

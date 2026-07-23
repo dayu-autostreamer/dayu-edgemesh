@@ -9,6 +9,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -21,12 +22,19 @@ const (
 )
 
 type managedObjectGetter interface {
+	ListManagedServices(ctx context.Context) (*v1.ServiceList, error)
 	GetService(ctx context.Context, namespace, name string) (*v1.Service, error)
 	GetEndpoints(ctx context.Context, namespace, name string) (*v1.Endpoints, error)
 }
 
 type kubeManagedObjectGetter struct {
 	client clientset.Interface
+}
+
+func (g kubeManagedObjectGetter) ListManagedServices(ctx context.Context) (*v1.ServiceList, error) {
+	return g.client.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{
+		LabelSelector: LabelMeshManaged + "=true",
+	})
 }
 
 func (g kubeManagedObjectGetter) GetService(ctx context.Context, namespace, name string) (*v1.Service, error) {
@@ -40,19 +48,26 @@ func (g kubeManagedObjectGetter) GetEndpoints(ctx context.Context, namespace, na
 // Controller attaches the managed projection to the already-existing
 // EdgeProxy Service and Endpoints informers. It creates no additional watches.
 type Controller struct {
-	store *Store
-	once  sync.Once
+	store       *Store
+	repairProxy func(service *v1.Service, endpoints *v1.Endpoints)
+	once        sync.Once
 }
 
 func NewController(store *Store) *Controller {
 	return &Controller{store: store}
 }
 
-func (c *Controller) Register(client clientset.Interface, serviceInformer, endpointsInformer cache.SharedIndexInformer, stopCh <-chan struct{}) error {
+func (c *Controller) Register(
+	client clientset.Interface,
+	serviceInformer, endpointsInformer cache.SharedIndexInformer,
+	repairProxy func(service *v1.Service, endpoints *v1.Endpoints),
+	stopCh <-chan struct{},
+) error {
 	if client == nil {
 		return fmt.Errorf("managed mesh repair client is required")
 	}
 	repairClient := kubeManagedObjectGetter{client: client}
+	c.repairProxy = repairProxy
 	c.once.Do(func() {
 		serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    func(obj interface{}) { c.onService(obj) },
@@ -77,7 +92,11 @@ func (c *Controller) Register(client clientset.Interface, serviceInformer, endpo
 }
 
 func (c *Controller) repairManagedObjects(client managedObjectGetter) {
+	repaired := c.discoverManagedObjects(client)
 	for _, key := range c.store.repairCandidates() {
+		if repaired[key.String()] {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), managedRepairTimeout)
 		service, serviceErr := client.GetService(ctx, key.Namespace, key.Name)
 		cancel()
@@ -110,23 +129,92 @@ func (c *Controller) repairManagedObjects(client managedObjectGetter) {
 			continue
 		}
 
-		if err := c.store.UpsertService(service); err != nil {
-			klog.ErrorS(err, "Repair managed Service projection", "service", key.String())
+		c.reconcileAuthoritativeObjects(key, service, endpoints, "MetaServer point lookup")
+	}
+}
+
+// discoverManagedObjects closes the recovery gap where both the userspace
+// proxier and the mesh-state informer miss a new Service Add event. Such an
+// object has no local key for point repair, so periodically discover the
+// bounded set of explicitly managed Services from the authoritative API.
+func (c *Controller) discoverManagedObjects(client managedObjectGetter) map[string]bool {
+	repaired := make(map[string]bool)
+	ctx, cancel := context.WithTimeout(context.Background(), managedRepairTimeout)
+	services, err := client.ListManagedServices(ctx)
+	cancel()
+	if err != nil {
+		klog.V(2).InfoS("Managed Service discovery lookup failed", "err", err)
+		return repaired
+	}
+	if services == nil {
+		klog.ErrorS(fmt.Errorf("empty ServiceList response"), "Managed Service discovery lookup failed")
+		return repaired
+	}
+
+	for i := range services.Items {
+		service := services.Items[i].DeepCopy()
+		if service.Labels[LabelMeshManaged] != "true" || !c.store.needsAuthoritativeRepair(service) {
 			continue
 		}
+		key := types.NamespacedName{Namespace: service.Namespace, Name: service.Name}
+		ctx, cancel = context.WithTimeout(context.Background(), managedRepairTimeout)
+		endpoints, endpointsErr := client.GetEndpoints(ctx, service.Namespace, service.Name)
+		cancel()
+		if endpointsErr != nil && !apierrors.IsNotFound(endpointsErr) {
+			klog.V(2).InfoS("Managed Endpoints discovery lookup failed", "endpoints", key.String(), "err", endpointsErr)
+			continue
+		}
+		c.reconcileAuthoritativeObjects(key, service, endpoints, "authoritative managed Service discovery")
+		repaired[key.String()] = true
+	}
+	return repaired
+}
+
+func (c *Controller) reconcileAuthoritativeObjects(
+	key types.NamespacedName,
+	service *v1.Service,
+	endpoints *v1.Endpoints,
+	source string,
+) {
+	name := key.String()
+	if err := c.store.UpsertService(service); err != nil {
+		klog.ErrorS(err, "Repair managed Service projection", "service", name)
+		return
+	}
+	if endpoints != nil {
 		if err := c.store.UpsertEndpoints(endpoints); err != nil {
-			klog.ErrorS(err, "Repair managed Endpoints projection", "endpoints", key.String())
-			continue
-		}
-		if c.store.projectionVerified(key) {
-			klog.InfoS("Recovered managed projection through MetaServer point lookup",
-				"service", key.String(),
-				"serviceResourceVersion", service.ResourceVersion,
-				"endpointsResourceVersion", endpoints.ResourceVersion)
-		} else {
-			klog.V(2).InfoS("Managed projection remains invalid after MetaServer point lookup", "service", key.String())
+			klog.ErrorS(err, "Repair managed Endpoints projection", "endpoints", name)
+			return
 		}
 	}
+
+	// Replaying the authoritative objects through the userspace proxier is
+	// necessary when the original Add event was missed by both consumers.
+	// Reconciliation is repeated only while the route is not fully APPLIED.
+	if c.repairProxy != nil && c.store.needsAuthoritativeRepair(service) {
+		var endpointsCopy *v1.Endpoints
+		if endpoints != nil {
+			endpointsCopy = endpoints.DeepCopy()
+		}
+		c.repairProxy(service.DeepCopy(), endpointsCopy)
+	}
+
+	if c.store.projectionVerified(key) {
+		klog.InfoS("Recovered managed projection",
+			"source", source,
+			"service", name,
+			"serviceResourceVersion", service.ResourceVersion,
+			"endpointsResourceVersion", resourceVersion(endpoints))
+	} else {
+		klog.V(2).InfoS("Managed projection remains invalid after repair", "source", source, "service", name)
+	}
+}
+
+func resourceVersion(obj *v1.Endpoints) string {
+	if obj == nil {
+		return ""
+	}
+	return obj.ResourceVersion
 }
 
 func (c *Controller) onService(obj interface{}) {

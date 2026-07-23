@@ -384,6 +384,28 @@ func (s *Store) projectionVerified(name types.NamespacedName) bool {
 	return s.verified[namespacedKey(name.Namespace, name.Name)] != ""
 }
 
+func (s *Store) needsAuthoritativeRepair(service *v1.Service) bool {
+	if service == nil || service.Labels[LabelMeshManaged] != "true" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot := s.snapshot.Load().(*Snapshot)
+	if s.projectionError != "" || snapshot.SourceState != SourceSynced {
+		return true
+	}
+	key := namespacedKey(service.Namespace, service.Name)
+	for _, route := range snapshot.Routes {
+		if route.Key() != key {
+			continue
+		}
+		return route.ServiceUID != service.UID ||
+			route.ServiceResourceVersion != service.ResourceVersion ||
+			route.Phase != PhaseApplied
+	}
+	return true
+}
+
 // MarkPortalPending is called before a managed userspace portal is opened.
 // Recording the identity first makes the data path fail closed even when the
 // proxier handler runs before the meshstate informer handler.
