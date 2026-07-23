@@ -1,8 +1,12 @@
 package meshstate
 
 import (
+	"bufio"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,26 +32,44 @@ type Store struct {
 	portalApplied map[string]bool   // keyed by Service UID and named port
 	verified      map[string]string // namespaced Service key -> current Service UID
 
-	snapshot atomic.Value // *Snapshot
+	managedHostsPath string
+	snapshot         atomic.Value // *Snapshot
 }
 
 func NewStore() *Store {
+	s, _ := newStore("")
+	return s
+}
+
+// NewStoreWithManagedHosts creates a managed-route store that atomically
+// projects every APPLIED route into a CoreDNS hosts file. The proxy route and
+// DNS record therefore share one validation/source-of-truth boundary.
+func NewStoreWithManagedHosts(path string) (*Store, error) {
+	return newStore(path)
+}
+
+func newStore(managedHostsPath string) (*Store, error) {
 	s := &Store{
-		services:      make(map[string]*v1.Service),
-		endpoints:     make(map[string]*v1.Endpoints),
-		managed:       make(map[string]bool),
-		portalApplied: make(map[string]bool),
-		verified:      make(map[string]string),
+		services:         make(map[string]*v1.Service),
+		endpoints:        make(map[string]*v1.Endpoints),
+		managed:          make(map[string]bool),
+		portalApplied:    make(map[string]bool),
+		verified:         make(map[string]string),
+		managedHostsPath: managedHostsPath,
 	}
-	s.snapshot.Store(&Snapshot{
+	initial := &Snapshot{
 		SourceState:   SourceSyncing,
 		SourceMessage: "waiting for Service and Endpoints informer caches to sync",
 		UpdatedAt:     time.Now().UTC(),
 		Routes:        make(map[string]Route),
 		servicePorts:  make(map[string]string),
 		serviceUIDs:   make(map[string]string),
-	})
-	return s
+	}
+	if err := writeManagedHostsFile(managedHostsPath, initial); err != nil {
+		return nil, fmt.Errorf("initialize managed runtime DNS projection: %w", err)
+	}
+	s.snapshot.Store(initial)
+	return s, nil
 }
 
 func (s *Store) Snapshot() *Snapshot {
@@ -649,4 +671,70 @@ func (s *Store) publishLocked(next *Snapshot) {
 	next.Sequence++
 	next.UpdatedAt = time.Now().UTC()
 	s.snapshot.Store(next)
+	if err := writeManagedHostsFile(s.managedHostsPath, next); err != nil {
+		// Sedna verifies the exact FQDN against ServiceIP before activation, so
+		// a failed publication cannot silently become a Ready RuntimeService.
+		klog.ErrorS(err, "Publish managed runtime DNS projection",
+			"path", s.managedHostsPath, "sequence", next.Sequence)
+	}
+}
+
+func writeManagedHostsFile(path string, snapshot *Snapshot) error {
+	if path == "" {
+		return nil
+	}
+	if snapshot == nil {
+		return fmt.Errorf("managed route snapshot is nil")
+	}
+
+	lines := make([]string, 0, len(snapshot.Routes))
+	if snapshot.SourceState == SourceSynced {
+		for _, route := range snapshot.Routes {
+			if route.Phase != PhaseApplied || net.ParseIP(route.ServiceIP) == nil || route.FQDN == "" {
+				continue
+			}
+			lines = append(lines, route.ServiceIP+" "+route.FQDN)
+		}
+	}
+	sort.Strings(lines)
+
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err := file.Chmod(0644); err != nil {
+		_ = file.Close()
+		return err
+	}
+	writer := bufio.NewWriter(file)
+	for _, line := range lines {
+		if _, err := writer.WriteString(line + "\n"); err != nil {
+			_ = file.Close()
+			return err
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
 }

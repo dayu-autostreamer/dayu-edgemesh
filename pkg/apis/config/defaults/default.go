@@ -29,11 +29,15 @@ const (
 
 	TempKubeConfigPath = "kubeconfig"
 	TempCorefilePath   = "Corefile"
-	MetaServerAddress  = "http://127.0.0.1:10550"
-	MetaServerCertDir  = BaseDir + "metaserver/"
-	MetaServerCaFile   = MetaServerCertDir + "rootCA.crt"
-	MetaServerCertFile = MetaServerCertDir + "server.crt"
-	MetaServerKeyFile  = MetaServerCertDir + "server.key"
+	// ManagedRuntimeHostsFilePath is the node-local DNS projection generated
+	// from the same validated managed-route snapshot consumed by EdgeProxy.
+	// Keeping it outside /etc/resolv.conf avoids mutating host-owned state.
+	ManagedRuntimeHostsFilePath = "/tmp/edgemesh-managed-runtime.hosts"
+	MetaServerAddress           = "http://127.0.0.1:10550"
+	MetaServerCertDir           = BaseDir + "metaserver/"
+	MetaServerCaFile            = MetaServerCertDir + "rootCA.crt"
+	MetaServerCertFile          = MetaServerCertDir + "server.crt"
+	MetaServerKeyFile           = MetaServerCertDir + "server.key"
 
 	EdgeMode   RunningMode = "EdgeMode"   // detected running on the edge
 	CloudMode  RunningMode = "CloudMode"  // detected running on the cloud

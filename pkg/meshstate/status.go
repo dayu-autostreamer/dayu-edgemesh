@@ -95,6 +95,8 @@ func (s *StatusServer) route(w http.ResponseWriter, r *http.Request) {
 	response := routeStatusResponse{
 		ServiceUID:               string(route.ServiceUID),
 		RuntimeServiceUID:        route.RuntimeServiceUID,
+		FQDN:                     route.FQDN,
+		ServiceIP:                route.ServiceIP,
 		ServiceResourceVersion:   route.ServiceResourceVersion,
 		EndpointsResourceVersion: route.EndpointsResourceVersion,
 		DeploymentRevision:       route.DeploymentRevision,
@@ -120,6 +122,8 @@ func (s *StatusServer) route(w http.ResponseWriter, r *http.Request) {
 type routeStatusResponse struct {
 	ServiceUID               string    `json:"serviceUID"`
 	RuntimeServiceUID        string    `json:"runtimeServiceUID"`
+	FQDN                     string    `json:"fqdn"`
+	ServiceIP                string    `json:"serviceIP"`
 	ServiceResourceVersion   string    `json:"serviceResourceVersion"`
 	EndpointsResourceVersion string    `json:"endpointsResourceVersion"`
 	DeploymentRevision       int64     `json:"deploymentRevision"`

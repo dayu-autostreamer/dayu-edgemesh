@@ -46,6 +46,9 @@ func TestRouteStatusRequiresKnownExactAppliedRoute(t *testing.T) {
 	if status.ServiceUID != "service-a" || status.RuntimeServiceUID != "runtime-service-a" || status.EndpointPodUID != "pod-a" {
 		t.Fatalf("status lost exact identity: %#v", status)
 	}
+	if status.FQDN != "runtime-a.default.svc.cluster.local" || status.ServiceIP != service.Spec.ClusterIP {
+		t.Fatalf("status lost the exact DNS projection: %#v", status)
+	}
 	if status.ServiceResourceVersion != "20" || status.EndpointsResourceVersion != "21" {
 		t.Fatalf("status lost observed resource versions: %#v", status)
 	}

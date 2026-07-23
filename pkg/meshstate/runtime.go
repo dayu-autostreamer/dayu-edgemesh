@@ -4,6 +4,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
 )
 
@@ -20,7 +21,10 @@ func NewRuntime(config *v1alpha1.ManagedRuntimeConfig) (*Runtime, error) {
 	if config == nil || !config.Enable {
 		return nil, nil
 	}
-	store := NewStore()
+	store, err := NewStoreWithManagedHosts(defaults.ManagedRuntimeHostsFilePath)
+	if err != nil {
+		return nil, err
+	}
 	return &Runtime{
 		Config:     config,
 		Store:      store,

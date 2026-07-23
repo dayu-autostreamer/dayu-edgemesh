@@ -35,10 +35,10 @@ spec:
               fieldPath: metadata.namespace
         resources:
           limits:
-            cpu: 200m
+            cpu: "1"
             memory: 256Mi
           requests:
-            cpu: 100m
+            cpu: 500m
             memory: 128Mi
         volumeMounts:
         - name: conf
