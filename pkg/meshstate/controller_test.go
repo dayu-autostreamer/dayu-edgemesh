@@ -75,3 +75,39 @@ func TestControllerRepairsOnlyInvalidManagedProjection(t *testing.T) {
 		t.Fatalf("deleted Endpoints route reopened: %#v", route)
 	}
 }
+
+func TestControllerRecoversManagedPortalWithCompletelyMissingProjection(t *testing.T) {
+	store := NewStore()
+	service, endpoints := managedObjects("service-a", "runtime-service-a")
+	service.ResourceVersion = "20"
+	endpoints.ResourceVersion = "20"
+	store.MarkSourceSynced()
+
+	// The proxier observed the managed Service and opened its portal, but the
+	// independent mesh-state informer missed the Service/Endpoints Add events.
+	store.MarkPortalPending(service.UID, servicePortName(service))
+	store.MarkPortalApplied(service.UID, servicePortName(service), true)
+	if _, exists := store.Snapshot().Routes["runtime-service-a"]; exists {
+		t.Fatal("test setup unexpectedly created a managed route")
+	}
+
+	client := &fakeManagedObjectGetter{
+		service:   service.DeepCopy(),
+		endpoints: endpoints.DeepCopy(),
+	}
+	NewController(store).repairManagedObjects(client)
+
+	route := requireRoute(t, store, "runtime-service-a")
+	if route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
+		t.Fatalf("missing managed projection was not recovered: %#v", route)
+	}
+	wantCalls := []string{
+		"services/default/runtime-a",
+		"endpoints/default/runtime-a",
+	}
+	if len(client.calls) != len(wantCalls) ||
+		client.calls[0] != wantCalls[0] ||
+		client.calls[1] != wantCalls[1] {
+		t.Fatalf("repair calls = %#v, want %#v", client.calls, wantCalls)
+	}
+}

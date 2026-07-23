@@ -300,7 +300,8 @@ func (s *Store) repairCandidates() []types.NamespacedName {
 
 	candidates := make([]types.NamespacedName, 0)
 	seen := make(map[string]bool)
-	for _, route := range s.snapshot.Load().(*Snapshot).Routes {
+	snapshot := s.snapshot.Load().(*Snapshot)
+	for _, route := range snapshot.Routes {
 		key := route.Key()
 		if seen[key] || !s.managed[key] {
 			continue
@@ -311,6 +312,34 @@ func (s *Store) repairCandidates() []types.NamespacedName {
 		// A confirmed delete must stay fail-closed; repair only objects that
 		// are still present but currently violate the managed route contract.
 		if s.services[key] == nil || s.endpoints[key] == nil {
+			continue
+		}
+		namespace, name, found := strings.Cut(key, "/")
+		if !found || namespace == "" || name == "" {
+			continue
+		}
+		candidates = append(candidates, types.NamespacedName{Namespace: namespace, Name: name})
+		seen[key] = true
+	}
+	// The userspace proxier and the mesh-state informer consume independent
+	// event streams.  A portal can therefore already exist while the managed
+	// Service Add event was lost completely.  Such a service has no Route to
+	// iterate above, so recover it from MetaServer by namespaced name.  A
+	// confirmed Endpoints deletion retains a degraded Route and is deliberately
+	// handled by the loop above, which still requires both cached objects; it
+	// therefore remains fail-closed.
+	for key, managed := range s.managed {
+		if !managed || seen[key] {
+			continue
+		}
+		hasRoute := false
+		for _, route := range snapshot.Routes {
+			if route.Key() == key {
+				hasRoute = true
+				break
+			}
+		}
+		if hasRoute {
 			continue
 		}
 		namespace, name, found := strings.Cut(key, "/")
