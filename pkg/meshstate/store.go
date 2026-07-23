@@ -29,6 +29,7 @@ type Store struct {
 	services      map[string]*v1.Service
 	endpoints     map[string]*v1.Endpoints
 	managed       map[string]bool
+	retiredUIDs   map[types.UID]struct{}
 	portalApplied map[string]bool   // keyed by Service UID and named port
 	verified      map[string]string // namespaced Service key -> current Service UID
 
@@ -54,6 +55,7 @@ func newStore(managedHostsPath string) (*Store, error) {
 		services:         make(map[string]*v1.Service),
 		endpoints:        make(map[string]*v1.Endpoints),
 		managed:          make(map[string]bool),
+		retiredUIDs:      make(map[types.UID]struct{}),
 		portalApplied:    make(map[string]bool),
 		verified:         make(map[string]string),
 		managedHostsPath: managedHostsPath,
@@ -106,6 +108,11 @@ func (s *Store) UpsertService(service *v1.Service) error {
 	defer s.mu.Unlock()
 
 	key := namespacedKey(service.Namespace, service.Name)
+	if _, retired := s.retiredUIDs[service.UID]; retired {
+		klog.V(4).InfoS("Ignore retired managed Service incarnation",
+			"service", key, "uid", service.UID)
+		return nil
+	}
 	current := s.services[key]
 	if current != nil && isOlderNumericResourceVersion(current.ResourceVersion, service.ResourceVersion) {
 		klog.InfoS("Ignore stale managed Service projection event",
@@ -166,7 +173,23 @@ func (s *Store) DeleteService(service *v1.Service) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.retiredUIDs[service.UID] = struct{}{}
 	return s.retireServiceLocked(service, "managed Service deleted")
+}
+
+// RetireService removes the locally cached incarnation for a namespaced name
+// after an authoritative API lookup confirms that the Service no longer
+// exists. Edge MetaManager caches can miss delete events, so informer state
+// alone is not sufficient to retain a managed route indefinitely.
+func (s *Store) RetireService(namespace, name, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	service := s.services[namespacedKey(namespace, name)]
+	if service == nil {
+		return nil
+	}
+	s.retiredUIDs[service.UID] = struct{}{}
+	return s.retireServiceLocked(service, reason)
 }
 
 func (s *Store) retireServiceLocked(service *v1.Service, reason string) error {
@@ -306,12 +329,15 @@ func (s *Store) repairCandidates() []types.NamespacedName {
 		if seen[key] || !s.managed[key] {
 			continue
 		}
-		if !projectionFailed && (route.Phase != PhaseDegraded || s.verified[key] != "") {
+		// APPLIED routes are already complete. READY and DEGRADED routes are
+		// revalidated by point lookup: this repairs missed informer events and
+		// retires stale Service incarnations left behind by a missed delete.
+		if !projectionFailed && route.Phase == PhaseApplied {
 			continue
 		}
 		// A confirmed delete must stay fail-closed; repair only objects that
 		// are still present but currently violate the managed route contract.
-		if s.services[key] == nil || s.endpoints[key] == nil {
+		if s.services[key] == nil {
 			continue
 		}
 		namespace, name, found := strings.Cut(key, "/")

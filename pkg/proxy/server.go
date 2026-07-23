@@ -291,7 +291,10 @@ func (s *Server) Run() error {
 		})
 	}
 	if s.managedRuntime != nil {
-		if err := s.managedRuntime.RegisterInformers(s.kubeClient, serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
+		// Keep event delivery on the edge MetaServer informers, but use the
+		// independent API client for point repair. This allows managed state to
+		// retire objects whose delete event was missed by the edge cache.
+		if err := s.managedRuntime.RegisterInformers(validationClient, serviceInformer.Informer(), endpointsInformer.Informer(), wait.NeverStop); err != nil {
 			return fmt.Errorf("register managed runtime informer handlers: %w", err)
 		}
 		if err := s.managedRuntime.StartStatusServer(); err != nil {

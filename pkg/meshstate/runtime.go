@@ -47,9 +47,9 @@ func (r *Runtime) Close() error {
 	return r.status.Close()
 }
 
-func (r *Runtime) RegisterInformers(client clientset.Interface, serviceInformer, endpointsInformer cache.SharedIndexInformer, stopCh <-chan struct{}) error {
+func (r *Runtime) RegisterInformers(repairClient clientset.Interface, serviceInformer, endpointsInformer cache.SharedIndexInformer, stopCh <-chan struct{}) error {
 	if r == nil {
 		return nil
 	}
-	return r.controller.Register(client, serviceInformer, endpointsInformer, stopCh)
+	return r.controller.Register(repairClient, serviceInformer, endpointsInformer, stopCh)
 }

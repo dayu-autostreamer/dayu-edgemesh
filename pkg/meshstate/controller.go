@@ -7,6 +7,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
@@ -81,6 +82,14 @@ func (c *Controller) repairManagedObjects(client managedObjectGetter) {
 		service, serviceErr := client.GetService(ctx, key.Namespace, key.Name)
 		cancel()
 		if serviceErr != nil {
+			if apierrors.IsNotFound(serviceErr) {
+				if err := c.store.RetireService(key.Namespace, key.Name, "authoritative Service lookup returned NotFound"); err != nil {
+					klog.ErrorS(err, "Retire stale managed Service projection", "service", key.String())
+				} else {
+					klog.InfoS("Retired stale managed Service projection", "service", key.String())
+				}
+				continue
+			}
 			klog.V(2).InfoS("Managed Service repair lookup failed", "service", key.String(), "err", serviceErr)
 			continue
 		}
