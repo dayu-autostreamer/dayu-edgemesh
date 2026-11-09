@@ -15,6 +15,7 @@ import (
 	"k8s.io/kubernetes/pkg/proxy/userspace"
 
 	"github.com/kubeedge/edgemesh/pkg/loadbalancer"
+	"github.com/kubeedge/edgemesh/pkg/tunnel"
 	netutil "github.com/kubeedge/edgemesh/pkg/util/net"
 )
 
@@ -70,8 +71,15 @@ func (tcp *tcpProxySocket) ListenPort() int {
 }
 
 func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *userspace.ServiceInfo, _ userspace.LoadBalancer) {
+	tcp.proxyConnections(myInfo.IsAlive, func(inConn net.Conn) (net.Conn, error) {
+		return internalLoadBalancer.TryConnectEndpoints(service, inConn.RemoteAddr(), "tcp", inConn, nil)
+	})
+}
+
+func (tcp *tcpProxySocket) proxyConnections(alive func() bool, connect func(net.Conn) (net.Conn, error)) {
+	setups := make(chan struct{}, 32)
 	for {
-		if !myInfo.IsAlive() {
+		if !alive() {
 			// The service port was closed or replaced.
 			return
 		}
@@ -85,7 +93,7 @@ func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *user
 			if netutil.IsClosedError(err) {
 				return
 			}
-			if !myInfo.IsAlive() {
+			if !alive() {
 				// Then the service port was just closed so the accept failure is to be expected.
 				return
 			}
@@ -93,17 +101,25 @@ func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *user
 			continue
 		}
 		klog.V(3).InfoS("Accepted TCP connection from remote", "remoteAddress", inConn.RemoteAddr(), "localAddress", inConn.LocalAddr())
-		outConn, err := internalLoadBalancer.TryConnectEndpoints(service, inConn.RemoteAddr(), "tcp", inConn, nil)
-		if err != nil {
-			klog.ErrorS(err, "Failed to connect to balancer")
-			err = inConn.Close()
+		setups <- struct{}{}
+		go func() {
+			defer func() { <-setups }()
+			// Also bound protocol inspection by a legacy load-balancing policy.
+			_ = inConn.SetReadDeadline(time.Now().Add(tunnel.ProxyConnectTimeout))
+			outConn, err := connect(inConn)
+			_ = inConn.SetReadDeadline(time.Time{})
 			if err != nil {
-				klog.ErrorS(err, "close error")
+				klog.ErrorS(err, "Failed to connect to balancer")
+				_ = inConn.Close()
+				return
 			}
-			continue
-		}
-		// Spin up an async copy loop.
-		go netutil.ProxyConn(inConn, outConn)
+			if !alive() {
+				_ = inConn.Close()
+				_ = outConn.Close()
+				return
+			}
+			go netutil.ProxyConn(inConn, outConn)
+		}()
 	}
 }
 

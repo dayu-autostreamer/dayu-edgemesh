@@ -273,18 +273,29 @@ func BenchmarkAddCircuitAddrsToPeer(b *testing.B) {
 }
 
 func TestGetIPsFromInterfaces(t *testing.T) {
-	eth0, err := net.InterfaceByName("eth0")
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		t.Errorf("Failed to get eth0 interface, err: %v", err)
+		t.Fatal(err)
 	}
-	eth0Addrs, err := eth0.Addrs()
+	var selected *net.Interface
+	for _, candidate := range interfaces {
+		if candidate.Flags&net.FlagLoopback == 0 && !isFilterInterfaces(candidate.Name, defaultFilteredInterfaces) {
+			copy := candidate
+			selected = &copy
+			break
+		}
+	}
+	if selected == nil {
+		t.Skip("no eligible network interface")
+	}
+	selectedAddrs, err := selected.Addrs()
 	if err != nil {
-		t.Errorf("Failed to get eth0 addrs, err: %v", err)
+		t.Fatal(err)
 	}
-	eth0IPs := make([]string, 0)
-	for _, addr := range eth0Addrs {
+	selectedIPs := make([]string, 0)
+	for _, addr := range selectedAddrs {
 		if ip, ipnet, err := net.ParseCIDR(addr.String()); err == nil && len(ipnet.Mask) == 4 {
-			eth0IPs = append(eth0IPs, ip.String())
+			selectedIPs = append(selectedIPs, ip.String())
 		}
 	}
 
@@ -302,22 +313,22 @@ func TestGetIPsFromInterfaces(t *testing.T) {
 			want:                    []string{"127.0.0.1"},
 		},
 		{
-			name:                    "eth0",
-			listenInterfaces:        "eth0",
+			name:                    "selected",
+			listenInterfaces:        selected.Name,
 			extraFilteredInterfaces: "",
-			want:                    eth0IPs,
+			want:                    selectedIPs,
 		},
 		{
-			name:                    "eth0 and lo",
-			listenInterfaces:        "eth0,lo",
+			name:                    "selected and lo",
+			listenInterfaces:        selected.Name + ",lo",
 			extraFilteredInterfaces: "",
-			want:                    append(eth0IPs, "127.0.0.1"),
+			want:                    append(selectedIPs, "127.0.0.1"),
 		},
 		{
-			name:                    "lo and eth0",
-			listenInterfaces:        "lo,eth0",
+			name:                    "lo and selected",
+			listenInterfaces:        "lo," + selected.Name,
 			extraFilteredInterfaces: "",
-			want:                    append([]string{"127.0.0.1"}, eth0IPs...),
+			want:                    append([]string{"127.0.0.1"}, selectedIPs...),
 		},
 		{
 			name:                    "invalid interface name",
@@ -326,10 +337,10 @@ func TestGetIPsFromInterfaces(t *testing.T) {
 			wantErr:                 true,
 		},
 		{
-			name:                    "eth0 and lo, lo filtered",
-			listenInterfaces:        "eth0,lo",
+			name:                    "selected and lo, lo filtered",
+			listenInterfaces:        selected.Name + ",lo",
 			extraFilteredInterfaces: "lo",
-			want:                    eth0IPs,
+			want:                    selectedIPs,
 		},
 	}
 	for _, tt := range tests {

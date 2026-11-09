@@ -1,20 +1,12 @@
 package proxy
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	istioclientset "istio.io/client-go/pkg/clientset/versioned"
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
@@ -23,8 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/proxy"
 	proxyconfigapi "k8s.io/kubernetes/pkg/proxy/apis/config"
@@ -38,12 +28,6 @@ import (
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
 	"github.com/kubeedge/edgemesh/pkg/loadbalancer"
 	"github.com/kubeedge/edgemesh/pkg/meshstate"
-	kubeedgeconstants "github.com/kubeedge/kubeedge/common/constants"
-)
-
-const (
-	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	serviceAccountCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )
 
 // Copy and update from https://github.com/kubernetes/kubernetes/blob/v1.23.0/cmd/kube-proxy/app/server.go and
@@ -128,567 +112,85 @@ func newProxyServer(
 }
 
 func (s *Server) Run() error {
-	// Determine the service filter mode.
-	// By default, we will proxy all services that are not labeled with the LabelEdgeMeshServiceProxyName label.
 	operation := selection.DoesNotExist
 	if s.serviceFilterMode != defaults.FilterIfLabelExistsMode {
 		operation = selection.Exists
 	}
-	noEdgeMeshProxyName, err := labels.NewRequirement(defaults.LabelEdgeMeshServiceProxyName, operation, nil)
+	proxyLabel, err := labels.NewRequirement(defaults.LabelEdgeMeshServiceProxyName, operation, nil)
 	if err != nil {
 		return err
 	}
-
-	noHeadlessEndpoints, err := labels.NewRequirement(v1.IsHeadlessService, selection.DoesNotExist, nil)
+	noHeadless, err := labels.NewRequirement(v1.IsHeadlessService, selection.DoesNotExist, nil)
 	if err != nil {
 		return err
 	}
-
-	labelSelector := labels.NewSelector()
-	labelSelector = labelSelector.Add(*noEdgeMeshProxyName, *noHeadlessEndpoints)
-
-	// Make informers that filter out objects that want a non-default service proxy.
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(s.kubeClient, s.ConfigSyncPeriod,
+	selector := labels.NewSelector().Add(*proxyLabel, *noHeadless)
+	factory := informers.NewSharedInformerFactoryWithOptions(s.kubeClient, s.ConfigSyncPeriod,
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = labelSelector.String()
+			options.LabelSelector = selector.String()
 		}))
-	namespaceInformerFactory := informers.NewSharedInformerFactory(s.kubeClient, s.ConfigSyncPeriod)
-	validationServiceInformerFactory := informerFactory
-	validationNamespaceInformerFactory := namespaceInformerFactory
-	validationClient := s.kubeClient
-	if directValidationClient, source, err := buildValidationClient(s.kubeClient); err == nil {
-		validationClient = directValidationClient
-		validationServiceInformerFactory = informers.NewSharedInformerFactoryWithOptions(validationClient, s.ConfigSyncPeriod,
-			informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-				options.LabelSelector = labelSelector.String()
-			}))
-		validationNamespaceInformerFactory = informers.NewSharedInformerFactory(validationClient, s.ConfigSyncPeriod)
-		klog.InfoS("Using independent Kubernetes API source for legacy EdgeMesh proxy recovery", "source", source)
-	} else {
-		klog.InfoS("Falling back to primary Kubernetes client for EdgeMesh proxy validation", "err", err)
-	}
-	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
-	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
-	// only notify on changes, and the initial update (on process start) may be lost if no handlers
-	// are registered yet.
-	serviceInformer := informerFactory.Core().V1().Services()
-	endpointsInformer := informerFactory.Core().V1().Endpoints()
-	validationServiceInformer := validationServiceInformerFactory.Core().V1().Services()
-	validationNamespaceInformer := validationNamespaceInformerFactory.Core().V1().Namespaces()
-	hasIndependentValidation := validationClient != s.kubeClient
-	if userspaceProxier, ok := s.Proxier.(*userspace.Proxier); ok {
+	services := factory.Core().V1().Services()
+	endpoints := factory.Core().V1().Endpoints()
+
+	if proxier, ok := s.Proxier.(*userspace.Proxier); ok {
+		// Service cache updates precede their callbacks. A separate Namespace
+		// watch can lag creation or replacement and must not veto this source.
+		proxier.SetServiceUIDExistsHandler(func(port proxy.ServicePortName, uid types.UID) bool {
+			if !services.Informer().HasSynced() {
+				return true
+			}
+			service, err := services.Lister().Services(port.Namespace).Get(port.Name)
+			if err != nil || service.UID != uid {
+				return false
+			}
+			for _, candidate := range service.Spec.Ports {
+				if candidate.Name == port.Port {
+					return true
+				}
+			}
+			return false
+		})
 		if s.managedRuntime != nil {
-			userspaceProxier.SetManagedServiceHandler(func(service *v1.Service) bool {
+			proxier.SetManagedServiceHandler(func(service *v1.Service) bool {
 				return service != nil && service.Labels[meshstate.LabelMeshManaged] == "true"
 			})
-			userspaceProxier.SetServicePendingHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID) {
-				s.managedRuntime.Store.MarkPortalPending(serviceUID, servicePort)
+			proxier.SetServicePendingHandler(func(port proxy.ServicePortName, uid types.UID) {
+				s.managedRuntime.Store.MarkPortalPending(uid, port)
 			})
-			userspaceProxier.SetServiceAppliedHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID, applied bool) {
-				s.managedRuntime.Store.MarkPortalApplied(serviceUID, servicePort, applied)
+			proxier.SetServiceAppliedHandler(func(port proxy.ServicePortName, uid types.UID, applied bool) {
+				s.managedRuntime.Store.MarkPortalApplied(uid, port, applied)
 			})
-			userspaceProxier.SetServiceRemovedHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID) {
-				s.managedRuntime.Store.MarkPortalRemoved(serviceUID, servicePort)
+			proxier.SetServiceRemovedHandler(func(port proxy.ServicePortName, uid types.UID) {
+				s.managedRuntime.Store.MarkPortalRemoved(uid, port)
 			})
 		}
-		userspaceProxier.SetNamespaceExistsHandler(func(namespace string) bool {
-			if validationNamespaceInformer.Informer().HasSynced() {
-				_, err := validationNamespaceInformer.Lister().Get(namespace)
-				return err == nil
-			}
-			if !hasIndependentValidation {
-				return true
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_, err := validationClient.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-			switch {
-			case err == nil:
-				return true
-			case apierrors.IsNotFound(err):
-				return false
-			default:
-				klog.V(2).InfoS("Namespace validation lookup failed, falling back to trusting primary source", "namespace", namespace, "err", err)
-				return true
-			}
-		})
-		userspaceProxier.SetServiceExistsHandler(func(servicePort proxy.ServicePortName) bool {
-			if validationServiceInformer.Informer().HasSynced() {
-				service, err := validationServiceInformer.Lister().Services(servicePort.NamespacedName.Namespace).Get(servicePort.NamespacedName.Name)
-				if err != nil {
-					return false
-				}
-				for i := range service.Spec.Ports {
-					if service.Spec.Ports[i].Name == servicePort.Port {
-						return true
-					}
-				}
-				return false
-			}
-			if !hasIndependentValidation {
-				return true
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			service, err := validationClient.CoreV1().Services(servicePort.NamespacedName.Namespace).Get(ctx, servicePort.NamespacedName.Name, metav1.GetOptions{})
-			switch {
-			case err == nil:
-			case apierrors.IsNotFound(err):
-				return false
-			default:
-				klog.V(2).InfoS("Service validation lookup failed, falling back to trusting primary source", "servicePortName", servicePort, "err", err)
-				return true
-			}
-			for i := range service.Spec.Ports {
-				if service.Spec.Ports[i].Name == servicePort.Port {
-					return true
-				}
-			}
-			return false
-		})
-		userspaceProxier.SetServiceUIDExistsHandler(func(servicePort proxy.ServicePortName, serviceUID types.UID) bool {
-			if validationServiceInformer.Informer().HasSynced() {
-				service, err := validationServiceInformer.Lister().Services(servicePort.NamespacedName.Namespace).Get(servicePort.NamespacedName.Name)
-				if err == nil {
-					if service.UID != serviceUID {
-						return false
-					}
-					for i := range service.Spec.Ports {
-						if service.Spec.Ports[i].Name == servicePort.Port {
-							return true
-						}
-					}
-					return false
-				}
-			}
-			if !hasIndependentValidation {
-				// Without an independent source, the managed event itself is
-				// the best available identity. Fail open until its primary
-				// informer catches up rather than dropping a new portal.
-				return true
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			service, err := validationClient.CoreV1().Services(servicePort.NamespacedName.Namespace).Get(ctx, servicePort.NamespacedName.Name, metav1.GetOptions{})
-			switch {
-			case err == nil:
-			case apierrors.IsNotFound(err):
-				return false
-			default:
-				klog.V(2).InfoS("Service incarnation validation lookup failed, falling back to trusting primary source",
-					"servicePortName", servicePort, "serviceUID", serviceUID, "err", err)
-				return true
-			}
-			if service.UID != serviceUID {
-				return false
-			}
-			for i := range service.Spec.Ports {
-				if service.Spec.Ports[i].Name == servicePort.Port {
-					return true
-				}
-			}
-			return false
-		})
 	}
+	// Both consumers observe the same ordered informer stream. Relists supply
+	// delete tombstones for objects missed during a disconnected watch.
 	if s.managedRuntime != nil {
-		// Keep event delivery on the edge MetaServer informers, but use the
-		// independent API client for discovery and point repair. Replaying a
-		// missing authoritative object through the proxier closes the case
-		// where both managed consumers missed the original Add event.
-		endpointsHandler, _ := s.Proxier.(config.EndpointsHandler)
-		repairProxy := func(service *v1.Service, endpoints *v1.Endpoints) {
-			s.Proxier.OnServiceAdd(service)
-			if endpoints != nil && endpointsHandler != nil {
-				endpointsHandler.OnEndpointsAdd(endpoints)
-			}
-		}
-		if err := s.managedRuntime.RegisterInformers(
-			validationClient,
-			serviceInformer.Informer(),
-			endpointsInformer.Informer(),
-			repairProxy,
-			wait.NeverStop,
-		); err != nil {
-			return fmt.Errorf("register managed runtime informer handlers: %w", err)
-		}
+		s.managedRuntime.RegisterInformers(services.Informer(), endpoints.Informer(), wait.NeverStop)
 		if err := s.managedRuntime.StartStatusServer(); err != nil {
-			return fmt.Errorf("start managed runtime status server: %w", err)
+			return err
 		}
 	}
-	if hasIndependentValidation && s.managedRuntime != nil {
-		// Managed objects and readiness remain on the primary MetaServer
-		// informers. The independent source owns only legacy events, restoring
-		// their recovery path without feeding cloud objects into managed state.
-		managedServiceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
-		managedServiceConfig.RegisterEventHandler(&classifiedServiceHandler{
-			handler:  s.Proxier,
-			managed:  true,
-			onSynced: s.Proxier.OnServiceSynced,
-		})
-		legacyServiceConfig := config.NewServiceConfig(validationServiceInformer, s.ConfigSyncPeriod)
-		legacyServiceConfig.RegisterEventHandler(&classifiedServiceHandler{
-			handler: s.Proxier,
-			managed: false,
-		})
-		go managedServiceConfig.Run(wait.NeverStop)
-		go legacyServiceConfig.Run(wait.NeverStop)
-
-		if endpointsHandler, ok := s.Proxier.(config.EndpointsHandler); ok {
-			managedEndpointsConfig := config.NewEndpointsConfig(endpointsInformer, s.ConfigSyncPeriod)
-			managedEndpointsConfig.RegisterEventHandler(&classifiedEndpointsHandler{
-				handler:  endpointsHandler,
-				managed:  true,
-				onSynced: endpointsHandler.OnEndpointsSynced,
-			})
-			legacyEndpointsConfig := config.NewEndpointsConfig(validationServiceInformerFactory.Core().V1().Endpoints(), s.ConfigSyncPeriod)
-			legacyEndpointsConfig.RegisterEventHandler(&classifiedEndpointsHandler{
-				handler: endpointsHandler,
-				managed: false,
-			})
-			go managedEndpointsConfig.Run(wait.NeverStop)
-			go legacyEndpointsConfig.Run(wait.NeverStop)
-		}
-	} else {
-		serviceConfig := config.NewServiceConfig(serviceInformer, s.ConfigSyncPeriod)
-		serviceConfig.RegisterEventHandler(s.Proxier)
-		go serviceConfig.Run(wait.NeverStop)
-
-		if endpointsHandler, ok := s.Proxier.(config.EndpointsHandler); ok {
-			endpointsConfig := config.NewEndpointsConfig(endpointsInformer, s.ConfigSyncPeriod)
-			endpointsConfig.RegisterEventHandler(endpointsHandler)
-			go endpointsConfig.Run(wait.NeverStop)
-		}
+	serviceConfig := config.NewServiceConfig(services, s.ConfigSyncPeriod)
+	serviceConfig.RegisterEventHandler(s.Proxier)
+	go serviceConfig.Run(wait.NeverStop)
+	if handler, ok := s.Proxier.(config.EndpointsHandler); ok {
+		endpointConfig := config.NewEndpointsConfig(endpoints, s.ConfigSyncPeriod)
+		endpointConfig.RegisterEventHandler(handler)
+		go endpointConfig.Run(wait.NeverStop)
 	}
-	// This has to start after the calls to NewServiceConfig and NewEndpointsConfig because those
-	// functions must configure their shared informer event handlers first.
-	informerFactory.Start(wait.NeverStop)
-	namespaceInformerFactory.Start(wait.NeverStop)
-	if validationClient != s.kubeClient {
-		validationServiceInformerFactory.Start(wait.NeverStop)
-		validationNamespaceInformerFactory.Start(wait.NeverStop)
-	}
-
-	// Run loadBalancer
+	factory.Start(wait.NeverStop)
 	s.loadBalancer.Config.Caller = defaults.ProxyCaller
-	err = s.loadBalancer.Run()
-	if err != nil {
+	if err := s.loadBalancer.Run(); err != nil {
 		if s.managedRuntime != nil {
-			if closeErr := s.managedRuntime.Close(); closeErr != nil {
-				klog.ErrorS(closeErr, "Close managed runtime status server after load balancer startup failure")
-			}
+			_ = s.managedRuntime.Close()
 		}
 		return fmt.Errorf("failed to run loadBalancer: %w", err)
 	}
-
 	go s.Proxier.SyncLoop()
-
 	return nil
-}
-
-func buildValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
-	var errs []error
-	if directClient, source, err := buildInClusterValidationClient(primaryClient); err == nil {
-		return directClient, source, nil
-	} else {
-		errs = append(errs, err)
-	}
-
-	if validationClient, source, err := buildServiceAccountValidationClient(primaryClient); err == nil {
-		return validationClient, source, nil
-	} else {
-		errs = append(errs, err)
-	}
-
-	if validationClient, source, err := buildKubeconfigValidationClient(); err == nil {
-		return validationClient, source, nil
-	} else {
-		errs = append(errs, err)
-	}
-
-	return nil, "", joinValidationErrors(errs)
-}
-
-func buildServiceAccountValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
-	endpointHost, err := discoverKubernetesEndpointHost(primaryClient)
-	if err != nil {
-		return nil, "", fmt.Errorf("serviceaccount validation unavailable: kubernetes endpoints discovery failed: %w", err)
-	}
-	if err := ensureReadableFile(serviceAccountTokenPath); err != nil {
-		return nil, "", fmt.Errorf("serviceaccount validation unavailable: token file %q is unavailable: %w", serviceAccountTokenPath, err)
-	}
-	if err := ensureReadableFile(serviceAccountCAPath); err != nil {
-		return nil, "", fmt.Errorf("serviceaccount validation unavailable: ca file %q is unavailable: %w", serviceAccountCAPath, err)
-	}
-
-	serviceAccountConfig := &rest.Config{
-		Host:            endpointHost,
-		BearerTokenFile: serviceAccountTokenPath,
-		Timeout:         3 * time.Second,
-		TLSClientConfig: rest.TLSClientConfig{
-			CAFile:     serviceAccountCAPath,
-			ServerName: "kubernetes.default.svc",
-		},
-	}
-
-	validationClient, err := clientset.NewForConfig(serviceAccountConfig)
-	if err != nil {
-		return nil, "", fmt.Errorf("serviceaccount validation unavailable: build client failed: %w", err)
-	}
-	if err := validateClientReachability(validationClient); err != nil {
-		return nil, "", fmt.Errorf("serviceaccount validation unavailable: client %q is unreachable: %w", endpointHost, err)
-	}
-
-	return validationClient, fmt.Sprintf("serviceaccount-endpoint:%s", endpointHost), nil
-}
-
-func buildInClusterValidationClient(primaryClient clientset.Interface) (clientset.Interface, string, error) {
-	inClusterConfig, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, "", fmt.Errorf("in-cluster config unavailable: %w", err)
-	}
-
-	directConfig := rest.CopyConfig(inClusterConfig)
-	directConfig.Timeout = 3 * time.Second
-	directClient, err := clientset.NewForConfig(directConfig)
-	if err != nil {
-		return nil, "", fmt.Errorf("build in-cluster client failed: %w", err)
-	}
-	directReachabilityErr := validateClientReachability(directClient)
-	if directReachabilityErr == nil {
-		return directClient, fmt.Sprintf("in-cluster:%s", directConfig.Host), nil
-	}
-
-	endpointHost, err := discoverKubernetesEndpointHost(primaryClient)
-	if err != nil {
-		return nil, "", fmt.Errorf("in-cluster client %q is unreachable: %v; kubernetes endpoints discovery failed: %w", directConfig.Host, directReachabilityErr, err)
-	}
-
-	endpointConfig := rest.CopyConfig(inClusterConfig)
-	endpointConfig.Host = endpointHost
-	endpointConfig.Timeout = 3 * time.Second
-	endpointConfig.TLSClientConfig.ServerName = "kubernetes.default.svc"
-
-	endpointClient, err := clientset.NewForConfig(endpointConfig)
-	if err != nil {
-		return nil, "", fmt.Errorf("build endpoint validation client failed: %w", err)
-	}
-	if err := validateClientReachability(endpointClient); err != nil {
-		return nil, "", fmt.Errorf("in-cluster client %q is unreachable: %v; endpoint validation client %q is unreachable: %w", directConfig.Host, directReachabilityErr, endpointHost, err)
-	}
-
-	return endpointClient, fmt.Sprintf("kubernetes-endpoint:%s", endpointHost), nil
-}
-
-func validateClientReachability(client clientset.Interface) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	_, err := client.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func discoverKubernetesEndpointHost(primaryClient clientset.Interface) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	endpoints, err := primaryClient.CoreV1().Endpoints("default").Get(ctx, "kubernetes", metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("get default/kubernetes endpoints failed: %w", err)
-	}
-
-	return kubernetesEndpointHost(endpoints)
-}
-
-func ensureReadableFile(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return fmt.Errorf("%s is a directory", path)
-	}
-	return nil
-}
-
-func kubernetesEndpointHost(endpoints *v1.Endpoints) (string, error) {
-	if endpoints == nil {
-		return "", errors.New("default/kubernetes endpoints are nil")
-	}
-
-	for _, subset := range endpoints.Subsets {
-		port, found := preferredEndpointPort(subset.Ports)
-		if !found {
-			continue
-		}
-		for _, address := range subset.Addresses {
-			if address.IP == "" {
-				continue
-			}
-			return fmt.Sprintf("https://%s", net.JoinHostPort(address.IP, strconv.Itoa(int(port)))), nil
-		}
-	}
-
-	return "", errors.New("default/kubernetes endpoints do not contain a ready address with a TCP port")
-}
-
-func preferredEndpointPort(ports []v1.EndpointPort) (int32, bool) {
-	var firstTCPPort int32
-	for _, port := range ports {
-		if port.Protocol != "" && port.Protocol != v1.ProtocolTCP {
-			continue
-		}
-		if firstTCPPort == 0 {
-			firstTCPPort = port.Port
-		}
-		if port.Name == "https" || port.Port == 443 {
-			return port.Port, true
-		}
-	}
-	if firstTCPPort == 0 {
-		return 0, false
-	}
-	return firstTCPPort, true
-}
-
-func isMetaServerHost(host string) bool {
-	if host == "" {
-		return false
-	}
-
-	rawHost := host
-	if strings.Contains(rawHost, "://") {
-		parsedURL, err := url.Parse(rawHost)
-		if err == nil && parsedURL.Host != "" {
-			rawHost = parsedURL.Host
-		}
-	}
-
-	hostname := rawHost
-	port := ""
-	if parsedHost, parsedPort, err := net.SplitHostPort(rawHost); err == nil {
-		hostname = parsedHost
-		port = parsedPort
-	}
-
-	hostname = strings.Trim(hostname, "[]")
-	if port != "10550" {
-		return false
-	}
-
-	switch strings.ToLower(hostname) {
-	case "127.0.0.1", "localhost", "::1":
-		return true
-	default:
-		return false
-	}
-}
-
-func joinValidationErrors(errs []error) error {
-	messages := make([]string, 0, len(errs))
-	for _, err := range errs {
-		if err == nil {
-			continue
-		}
-		messages = append(messages, err.Error())
-	}
-	if len(messages) == 0 {
-		return nil
-	}
-	return errors.New(strings.Join(messages, "; "))
-}
-
-func buildKubeconfigValidationClient() (clientset.Interface, string, error) {
-	var errs []error
-	if validationClient, source, err := buildValidationClientFromLoadingRules(); err == nil {
-		return validationClient, source, nil
-	} else {
-		errs = append(errs, err)
-	}
-
-	for _, kubeConfigPath := range kubeconfigCandidatePaths() {
-		if err := ensureReadableFile(kubeConfigPath); err != nil {
-			errs = append(errs, fmt.Errorf("kubeconfig validation unavailable: kubeconfig path %q is unavailable: %w", kubeConfigPath, err))
-			continue
-		}
-		validationClient, source, err := buildValidationClientFromPath(kubeConfigPath)
-		if err == nil {
-			return validationClient, source, nil
-		}
-		errs = append(errs, err)
-	}
-
-	return nil, "", joinValidationErrors(errs)
-}
-
-func buildValidationClientFromLoadingRules() (clientset.Interface, string, error) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		loadingRules,
-		&clientcmd.ConfigOverrides{},
-	).ClientConfig()
-	if err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: load config failed: %w", err)
-	}
-	return buildValidationClientFromConfig(kubeConfig, fmt.Sprintf("kubeconfig:%s", kubeConfig.Host))
-}
-
-func buildValidationClientFromPath(kubeConfigPath string) (clientset.Interface, string, error) {
-	kubeConfig, err := clientcmd.BuildConfigFromFlags("", kubeConfigPath)
-	if err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: load config from %q failed: %w", kubeConfigPath, err)
-	}
-	return buildValidationClientFromConfig(kubeConfig, fmt.Sprintf("kubeconfig-file:%s", kubeConfigPath))
-}
-
-func buildValidationClientFromConfig(kubeConfig *rest.Config, source string) (clientset.Interface, string, error) {
-	if kubeConfig == nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: config for %s is nil", source)
-	}
-	if isMetaServerHost(kubeConfig.Host) {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: %s points to MetaServer host %q", source, kubeConfig.Host)
-	}
-
-	kubeConfig = rest.CopyConfig(kubeConfig)
-	kubeConfig.Timeout = 3 * time.Second
-	validationClient, err := clientset.NewForConfig(kubeConfig)
-	if err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: build client for %s failed: %w", source, err)
-	}
-	if err := validateClientReachability(validationClient); err != nil {
-		return nil, "", fmt.Errorf("kubeconfig validation unavailable: client for %s is unreachable: %w", source, err)
-	}
-
-	return validationClient, source, nil
-}
-
-func kubeconfigCandidatePaths() []string {
-	paths := []string{
-		kubeedgeconstants.DefaultKubeletConfig,
-		"/root/.kube/config",
-		"/etc/kubernetes/admin.conf",
-		"/etc/rancher/k3s/k3s.yaml",
-	}
-
-	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
-		paths = append(paths, filepath.Join(homeDir, ".kube", "config"))
-	}
-
-	seen := make(map[string]struct{}, len(paths))
-	deduped := make([]string, 0, len(paths))
-	for _, path := range paths {
-		if path == "" {
-			continue
-		}
-		if _, exists := seen[path]; exists {
-			continue
-		}
-		seen[path] = struct{}{}
-		deduped = append(deduped, path)
-	}
-	return deduped
 }
 
 // CleanupAndExit remove iptables rules

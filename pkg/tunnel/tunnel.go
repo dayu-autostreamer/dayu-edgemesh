@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -43,8 +44,8 @@ import (
 const (
 	MaxReadSize = 4096
 
-	DailRetryTime = 3
-	DailSleepTime = 500 * time.Microsecond
+	// Bound setup on both peers; established streams have no such deadline.
+	ProxyConnectTimeout = 2 * time.Second
 
 	RetryTime     = 3
 	RetryInterval = 2 * time.Second
@@ -112,7 +113,7 @@ func (t *EdgeTunnel) runDhtDiscovery() {
 }
 
 func (t *EdgeTunnel) isRelayPeer(id peer.ID) bool {
-	for _, relay := range t.relayMap {
+	for _, relay := range t.relaySnapshot() {
 		if relay.ID == id {
 			return true
 		}
@@ -134,7 +135,7 @@ func (t *EdgeTunnel) discovery(discoverType defaults.DiscoveryType, pi peer.Addr
 	// This is done to avoid delays in RESERVATION https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md.
 	if discoverType == defaults.DhtDiscovery && !t.isRelayPeer(pi.ID) {
 		addrInfo := peer.AddrInfo{ID: pi.ID, Addrs: []ma.Multiaddr{}}
-		err := AddCircuitAddrsToPeer(&addrInfo, t.relayMap)
+		err := AddCircuitAddrsToPeer(&addrInfo, t.relaySnapshot())
 		if err != nil {
 			klog.Errorf("Failed to add circuit addrs to peer %s", addrInfo)
 			return
@@ -195,7 +196,7 @@ func (t *EdgeTunnel) discovery(discoverType defaults.DiscoveryType, pi peer.Addr
 	// (re)mapping nodeName and peerID
 	nodeName := msg.GetNodeName()
 	klog.Infof("[%s] Discovery to %s : %s", protocol, nodeName, pi)
-	t.nodePeerMap[nodeName] = pi.ID
+	t.rememberPeer(nodeName, pi.ID)
 }
 
 // discoveryStreamHandler handles incoming streams for discovery service.
@@ -237,7 +238,7 @@ func (t *EdgeTunnel) discoveryStreamHandler(stream network.Stream) {
 
 	// (re)mapping nodeName and peerID
 	klog.Infof("[%s] Discovery from %s : %s", protocol, nodeName, remotePeer)
-	t.nodePeerMap[nodeName] = remotePeer.ID
+	t.rememberPeer(nodeName, remotePeer.ID)
 }
 
 type ProxyOptions struct {
@@ -253,12 +254,14 @@ type ProxyOptions struct {
 // It then opens a new stream using the libp2p host, and performs a handshake with the destination peer over the stream.
 // If the handshake is successful, it returns a new StreamConn object representing the stream.
 // If any errors occur during the process, it returns an error.
-func (t *EdgeTunnel) GetProxyStream(opts ProxyOptions) (*StreamConn, error) {
+func (t *EdgeTunnel) GetProxyStream(ctx context.Context, opts ProxyOptions) (*StreamConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, ProxyConnectTimeout)
+	defer cancel()
 	var destInfo peer.AddrInfo
 	var err error
 
 	destName := opts.NodeName
-	destID, exists := t.nodePeerMap[destName]
+	destID, exists := t.cachedPeer(destName)
 	if !exists {
 		destID, err = PeerIDFromString(destName)
 		if err != nil {
@@ -267,21 +270,30 @@ func (t *EdgeTunnel) GetProxyStream(opts ProxyOptions) (*StreamConn, error) {
 		destInfo = peer.AddrInfo{ID: destID, Addrs: []ma.Multiaddr{}}
 		// mapping nodeName and peerID
 		klog.Infof("Could not find peer %s in cache, auto generate peer info: %s", destName, destInfo)
-		t.nodePeerMap[destName] = destID
+		t.rememberPeer(destName, destID)
 	} else {
 		destInfo = t.p2pHost.Peerstore().PeerInfo(destID)
 	}
-	if err = AddCircuitAddrsToPeer(&destInfo, t.relayMap); err != nil {
+	if err = AddCircuitAddrsToPeer(&destInfo, t.relaySnapshot()); err != nil {
 		return nil, fmt.Errorf("failed to add circuit addrs to peer %s", destInfo)
 	}
 	t.p2pHost.Peerstore().AddAddrs(destInfo.ID, destInfo.Addrs, peerstore.PermanentAddrTTL)
 
-	stream, err := t.p2pHost.NewStream(network.WithUseTransient(t.hostCtx, "relay"), destID, defaults.ProxyProtocol)
+	stream, err := t.p2pHost.NewStream(network.WithUseTransient(ctx, "relay"), destID, defaults.ProxyProtocol)
 	if err != nil {
 		return nil, fmt.Errorf("new stream between %s: %s err: %w", destName, destInfo, err)
 	}
 	klog.Infof("New stream between peer %s: %s success", destName, destInfo)
-	// defer stream.Close() // will close the stream elsewhere
+	established := false
+	defer func() {
+		if !established {
+			_ = stream.Reset()
+		}
+	}()
+	deadline, _ := ctx.Deadline()
+	if err := stream.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
 
 	streamWriter := protoio.NewDelimitedWriter(stream)
 	streamReader := protoio.NewDelimitedReader(stream, MaxReadSize)
@@ -295,127 +307,84 @@ func (t *EdgeTunnel) GetProxyStream(opts ProxyOptions) (*StreamConn, error) {
 		Port:     &opts.Port,
 	}
 	if err = streamWriter.WriteMsg(msg); err != nil {
-		resetErr := stream.Reset()
-		if resetErr != nil {
-			return nil, fmt.Errorf("stream between %s reset err: %w", opts.NodeName, resetErr)
-		}
 		return nil, fmt.Errorf("write conn msg to %s err: %w", opts.NodeName, err)
 	}
 
 	// read response
 	msg.Reset()
 	if err = streamReader.ReadMsg(msg); err != nil {
-		resetErr := stream.Reset()
-		if resetErr != nil {
-			return nil, fmt.Errorf("stream between %s reset err: %w", opts.NodeName, resetErr)
-		}
 		return nil, fmt.Errorf("read conn result msg from %s err: %w", opts.NodeName, err)
 	}
-	if msg.GetType() == proxypb.Proxy_FAILED {
-		resetErr := stream.Reset()
-		if resetErr != nil {
-			return nil, fmt.Errorf("stream between %s reset err: %w", opts.NodeName, err)
-		}
+	if msg.GetType() != proxypb.Proxy_SUCCESS {
 		return nil, fmt.Errorf("libp2p dial %v err: Proxy.type is %s", opts, msg.GetType())
 	}
 
 	msg.Reset()
 	klog.V(4).Infof("libp2p dial %v success", opts)
 
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	established = true
 	return NewStreamConn(stream), nil
 }
 
 func (t *EdgeTunnel) proxyStreamHandler(stream network.Stream) {
-	remotePeer := peer.AddrInfo{
-		ID:    stream.Conn().RemotePeer(),
-		Addrs: []ma.Multiaddr{stream.Conn().RemoteMultiaddr()},
+	ctx, cancel := context.WithTimeout(t.hostCtx, ProxyConnectTimeout)
+	defer cancel()
+	established := false
+	defer func() {
+		if !established {
+			_ = stream.Reset()
+		}
+	}()
+	deadline, _ := ctx.Deadline()
+	if err := stream.SetDeadline(deadline); err != nil {
+		return
 	}
-	klog.Infof("Proxy service got a new stream from %s", remotePeer)
-
-	streamWriter := protoio.NewDelimitedWriter(stream)
-	streamReader := protoio.NewDelimitedReader(stream, MaxReadSize) // TODO get maxSize from default
-
-	// read handshake
+	writer := protoio.NewDelimitedWriter(stream)
+	reader := protoio.NewDelimitedReader(stream, MaxReadSize)
 	msg := new(proxypb.Proxy)
-	err := streamReader.ReadMsg(msg)
-	if err != nil {
-		klog.Errorf("Read msg from %s err: %v", remotePeer, err)
+	if err := reader.ReadMsg(msg); err != nil {
+		klog.Errorf("Read proxy handshake: %v", err)
 		return
 	}
 	if msg.GetType() != proxypb.Proxy_CONNECT {
-		klog.Errorf("Read msg from %s type should be CONNECT", remotePeer)
 		return
 	}
-	targetProto := msg.GetProtocol()
-	targetNode := msg.GetNodeName()
-	targetIP := msg.GetIp()
-	targetPort := msg.GetPort()
-	targetAddr := fmt.Sprintf("%s:%d", targetIP, targetPort)
-
-	proxyConn, err := tryDialEndpoint(targetProto, targetIP, int(targetPort))
+	protocol := msg.GetProtocol()
+	conn, err := tryDialEndpoint(ctx, protocol, msg.GetIp(), int(msg.GetPort()))
 	if err != nil {
-		klog.Errorf("l4 proxy connect to %v err: %v", msg, err)
-		msg.Reset()
+		klog.Errorf("Dial proxy endpoint: %v", err)
 		msg.Type = proxypb.Proxy_FAILED.Enum()
-		if err = streamWriter.WriteMsg(msg); err != nil {
-			klog.Errorf("Write msg to %s err: %v", remotePeer, err)
-			return
+		_ = writer.WriteMsg(msg)
+		return
+	}
+	defer func() {
+		if !established {
+			_ = conn.Close()
 		}
-		return
-	}
-
-	// write response
+	}()
 	msg.Type = proxypb.Proxy_SUCCESS.Enum()
-	err = streamWriter.WriteMsg(msg)
-	if err != nil {
-		klog.Errorf("Write msg to %s err: %v", remotePeer, err)
+	if err := writer.WriteMsg(msg); err != nil {
 		return
 	}
-	msg.Reset()
-
-	streamConn := NewStreamConn(stream)
-	switch targetProto {
-	case TCP:
-		go netutil.ProxyConn(streamConn, proxyConn)
-	case UDP:
-		go netutil.ProxyConnUDP(streamConn, proxyConn.(*net.UDPConn))
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		return
 	}
-	klog.Infof("Success proxy for {%s %s %s}", targetProto, targetNode, targetAddr)
+	established = true
+	if protocol == TCP {
+		go netutil.ProxyConn(NewStreamConn(stream), conn)
+	} else {
+		go netutil.ProxyConnUDP(NewStreamConn(stream), conn.(*net.UDPConn))
+	}
 }
 
-// tryDialEndpoint tries to dial to an endpoint with given protocol, ip and port.
-// If TCP or UDP protocol is used, it retries several times and waits for DailSleepTime between each try.
-// If neither TCP nor UDP is used, it returns an error with an unsupported protocol message.
-// when maximum retries are reached for the given protocol, it logs the error and returns it.
-func tryDialEndpoint(protocol, ip string, port int) (conn net.Conn, err error) {
-	switch protocol {
-	case TCP:
-		for i := 0; i < DailRetryTime; i++ {
-			conn, err = net.DialTCP(TCP, nil, &net.TCPAddr{
-				IP:   net.ParseIP(ip),
-				Port: port,
-			})
-			if err == nil {
-				return conn, nil
-			}
-			time.Sleep(DailSleepTime)
-		}
-	case UDP:
-		for i := 0; i < DailRetryTime; i++ {
-			conn, err = net.DialUDP(UDP, nil, &net.UDPAddr{
-				IP:   net.ParseIP(ip),
-				Port: int(port),
-			})
-			if err == nil {
-				return conn, nil
-			}
-			time.Sleep(DailSleepTime)
-		}
-	default:
+func tryDialEndpoint(ctx context.Context, protocol, ip string, port int) (net.Conn, error) {
+	if protocol != TCP && protocol != UDP {
 		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
 	}
-	klog.Errorf("max retries for dial")
-	return nil, err
+	return (&net.Dialer{}).DialContext(ctx, protocol, net.JoinHostPort(ip, strconv.Itoa(port)))
 }
 
 // BootstrapConnect tries to connect to a list of bootstrap peers in a relay map.
@@ -484,6 +453,8 @@ func newDHT(ctx context.Context, host p2phost.Host, relayPeers RelayMap) (*dual.
 }
 
 func (t *EdgeTunnel) nodeNameFromPeerID(id peer.ID) (string, bool) {
+	t.peerMu.RLock()
+	defer t.peerMu.RUnlock()
 	for nodeName, peerID := range t.nodePeerMap {
 		if peerID == id {
 			return nodeName, true
@@ -496,7 +467,7 @@ func (t *EdgeTunnel) runRelayFinder(ddht *dual.DHT, peerSource chan peer.AddrInf
 	klog.Infof("Starting relay finder")
 	err := wait.PollUntil(period, func() (done bool, err error) {
 		// ensure peers in same LAN can send [hop]RESERVE to the relay
-		for _, relay := range t.relayMap {
+		for _, relay := range t.relaySnapshot() {
 			if relay.ID == t.p2pHost.ID() {
 				continue
 			}
@@ -544,6 +515,8 @@ func (t *EdgeTunnel) refreshRelayMap(nodeName string, dhtPeer *peer.AddrInfo) {
 	dhtPeer.Addrs = FilterPrivateMaddr(dhtPeer.Addrs)
 	dhtPeer.Addrs = FilterCircuitMaddr(dhtPeer.Addrs)
 
+	t.peerMu.Lock()
+	defer t.peerMu.Unlock()
 	relayInfo, exists := t.relayMap[nodeName]
 	if !exists {
 		t.relayMap[nodeName] = dhtPeer
@@ -570,7 +543,7 @@ func (t *EdgeTunnel) runHeartbeat() {
 
 func (t *EdgeTunnel) connectToRelays(connectType string) {
 	wg := sync.WaitGroup{}
-	for _, relay := range t.relayMap {
+	for _, relay := range t.relaySnapshot() {
 		wg.Add(1)
 		go func(relay *peer.AddrInfo) {
 			defer wg.Done()
@@ -669,10 +642,12 @@ func (t *EdgeTunnel) doReload(configPath string) {
 	for nodeName, pi := range relayMap {
 		klog.Infof("%s => %s", nodeName, pi)
 	}
+	t.peerMu.Lock()
 	t.relayMap = relayMap
+	t.peerMu.Unlock()
 
 	// enable or disable relayv2 service
-	_, exists := t.relayMap[t.Config.NodeName]
+	_, exists := relayMap[t.Config.NodeName]
 	if exists {
 		if t.relayService == nil && t.Config.Mode == defaults.ServerClientMode {
 			t.relayService, err = relayv2.New(t.p2pHost, relayv2.WithLimit(nil))
@@ -734,7 +709,7 @@ func (t *EdgeTunnel) GetCNIAdapterStream(opts ProxyOptions) (*StreamConn, error)
 	var err error
 
 	destName := opts.NodeName
-	destID, exists := t.nodePeerMap[destName]
+	destID, exists := t.cachedPeer(destName)
 	if !exists {
 		destID, err = PeerIDFromString(destName)
 		if err != nil {
@@ -743,11 +718,11 @@ func (t *EdgeTunnel) GetCNIAdapterStream(opts ProxyOptions) (*StreamConn, error)
 		destInfo = peer.AddrInfo{ID: destID, Addrs: []ma.Multiaddr{}}
 		// mapping nodeName and peerID
 		klog.Infof("[CNI]Could not find peer %s in cache, auto generate peer info: %s", destName, destInfo)
-		t.nodePeerMap[destName] = destID
+		t.rememberPeer(destName, destID)
 	} else {
 		destInfo = t.p2pHost.Peerstore().PeerInfo(destID)
 	}
-	if err = AddCircuitAddrsToPeer(&destInfo, t.relayMap); err != nil {
+	if err = AddCircuitAddrsToPeer(&destInfo, t.relaySnapshot()); err != nil {
 		return nil, fmt.Errorf("failed to add circuit addrs to peer %s", destInfo)
 	}
 	t.p2pHost.Peerstore().AddAddrs(destInfo.ID, destInfo.Addrs, peerstore.PermanentAddrTTL)
@@ -858,4 +833,27 @@ func (t *EdgeTunnel) CNIAdapterStreamHandler(stream network.Stream) {
 	klog.Infof("Get Tunnel data")
 	go cni.DialTun(streamConn, defaults.TunDeviceName)
 	klog.Infof("[CNI]Success proxy CNI data for {%s %s %s}", targetProto, targetNode, targetAddr)
+}
+
+func (t *EdgeTunnel) cachedPeer(name string) (peer.ID, bool) {
+	t.peerMu.RLock()
+	defer t.peerMu.RUnlock()
+	id, ok := t.nodePeerMap[name]
+	return id, ok
+}
+
+func (t *EdgeTunnel) rememberPeer(name string, id peer.ID) {
+	t.peerMu.Lock()
+	defer t.peerMu.Unlock()
+	t.nodePeerMap[name] = id
+}
+
+func (t *EdgeTunnel) relaySnapshot() RelayMap {
+	t.peerMu.RLock()
+	defer t.peerMu.RUnlock()
+	result := make(RelayMap, len(t.relayMap))
+	for name, info := range t.relayMap {
+		result[name] = &peer.AddrInfo{ID: info.ID, Addrs: append([]ma.Multiaddr(nil), info.Addrs...)}
+	}
+	return result
 }

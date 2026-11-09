@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -34,8 +35,9 @@ var Agent *EdgeTunnel
 // EdgeTunnel is used for solving cross subset communication
 type EdgeTunnel struct {
 	Config           *v1alpha1.EdgeTunnelConfig
-	p2pHost          p2phost.Host       // libp2p host
-	hostCtx          context.Context    // ctx governs the lifetime of the libp2p host
+	p2pHost          p2phost.Host    // libp2p host
+	hostCtx          context.Context // ctx governs the lifetime of the libp2p host
+	peerMu           sync.RWMutex
 	nodePeerMap      map[string]peer.ID // map of Kubernetes node name and peer.ID
 	mdnsPeerChan     chan peer.AddrInfo
 	dhtPeerChan      <-chan peer.AddrInfo

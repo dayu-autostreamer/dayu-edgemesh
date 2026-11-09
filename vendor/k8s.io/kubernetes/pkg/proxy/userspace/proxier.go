@@ -417,12 +417,9 @@ func (proxier *Proxier) syncProxyRules() {
 
 	if err := iptablesInit(proxier.iptables); err != nil {
 		klog.ErrorS(err, "Failed to ensure iptables")
+		proxier.scheduleSyncRetry()
+		return
 	}
-
-	proxier.serviceChangesLock.Lock()
-	changes := proxier.serviceChanges
-	proxier.serviceChanges = make(map[types.NamespacedName]*serviceChange)
-	proxier.serviceChangesLock.Unlock()
 
 	proxier.mu.Lock()
 	defer proxier.mu.Unlock()
@@ -432,6 +429,18 @@ func (proxier *Proxier) syncProxyRules() {
 	// deleted ClusterIP; leaving the stale iptables rule first in the chain
 	// would redirect the new Service to the old proxy socket.
 	proxier.cleanupOrphanedServices()
+	// Remove shadowing kernel rules before opening or acknowledging new routes.
+	// Keep the pending change set intact if observation or cleanup fails.
+	if err := proxier.cleanupOrphanedRules(); err != nil {
+		klog.ErrorS(err, "Failed to reconcile userspace portal rules")
+		proxier.scheduleSyncRetry()
+		return
+	}
+
+	proxier.serviceChangesLock.Lock()
+	changes := proxier.serviceChanges
+	proxier.serviceChanges = make(map[types.NamespacedName]*serviceChange)
+	proxier.serviceChangesLock.Unlock()
 
 	klog.V(4).InfoS("userspace proxy: processing service events", "count", len(changes))
 	for _, entry := range orderedServiceChanges(changes) {
@@ -670,7 +679,6 @@ func (proxier *Proxier) currentServicePortNames(service *v1.Service) sets.String
 	}
 
 	existingPorts := sets.NewString()
-	managed := proxier.managedService != nil && proxier.managedService(service)
 	for i := range service.Spec.Ports {
 		servicePort := &service.Spec.Ports[i]
 		serviceName := proxy.ServicePortName{
@@ -678,9 +686,6 @@ func (proxier *Proxier) currentServicePortNames(service *v1.Service) sets.String
 			Port:           servicePort.Name,
 		}
 		exists := proxier.serviceIncarnationStillExists(serviceName, service.UID)
-		if !managed {
-			exists = proxier.serviceStillExists(serviceName)
-		}
 		if exists {
 			existingPorts.Insert(servicePort.Name)
 		} else {
@@ -721,9 +726,6 @@ func (proxier *Proxier) cleanupOrphanedServices() {
 			continue
 		}
 		exists := proxier.serviceIncarnationStillExists(serviceName, info.serviceUID)
-		if !info.managed {
-			exists = proxier.serviceStillExists(serviceName)
-		}
 		if exists {
 			continue
 		}

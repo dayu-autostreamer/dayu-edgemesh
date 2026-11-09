@@ -54,6 +54,12 @@ func newEdgeDNS(c *v1alpha1.EdgeDNSConfig, cli *clients.Clients) (*EdgeDNS, erro
 		return &EdgeDNS{Config: c}, nil
 	}
 
+	// CoreDNS uses its own informer cache with the shared resolved API config.
+	if !c.CacheDNS.Enable {
+		if err := cli.WriteKubeConfig(defaults.TempDNSKubeConfigPath); err != nil {
+			return nil, fmt.Errorf("write DNS API config: %w", err)
+		}
+	}
 	// update Corefile for node-local dns
 	err := UpdateCorefile(c, cli.GetKubeClient())
 	if err != nil {

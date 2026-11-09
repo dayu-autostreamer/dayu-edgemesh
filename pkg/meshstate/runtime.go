@@ -1,11 +1,8 @@
 package meshstate
 
 import (
-	v1 "k8s.io/api/core/v1"
-	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/kubeedge/edgemesh/pkg/apis/config/defaults"
 	"github.com/kubeedge/edgemesh/pkg/apis/config/v1alpha1"
 )
 
@@ -22,10 +19,7 @@ func NewRuntime(config *v1alpha1.ManagedRuntimeConfig) (*Runtime, error) {
 	if config == nil || !config.Enable {
 		return nil, nil
 	}
-	store, err := NewStoreWithManagedHosts(defaults.ManagedRuntimeHostsFilePath)
-	if err != nil {
-		return nil, err
-	}
+	store := NewStore()
 	return &Runtime{
 		Config:     config,
 		Store:      store,
@@ -48,14 +42,8 @@ func (r *Runtime) Close() error {
 	return r.status.Close()
 }
 
-func (r *Runtime) RegisterInformers(
-	repairClient clientset.Interface,
-	serviceInformer, endpointsInformer cache.SharedIndexInformer,
-	repairProxy func(service *v1.Service, endpoints *v1.Endpoints),
-	stopCh <-chan struct{},
-) error {
-	if r == nil {
-		return nil
+func (r *Runtime) RegisterInformers(services, endpoints cache.SharedIndexInformer, stop <-chan struct{}) {
+	if r != nil {
+		r.controller.Register(services, endpoints, stop)
 	}
-	return r.controller.Register(repairClient, serviceInformer, endpointsInformer, repairProxy, stopCh)
 }

@@ -254,7 +254,9 @@ func proxyConnectToRemote(host string, targetIP string, port int32, conn net.Con
 		IP:       targetIP,
 		Port:     port,
 	}
-	stream, err := tunnel.Agent.GetProxyStream(proxyOpts)
+	ctx, cancel := context.WithTimeout(context.Background(), tunnel.ProxyConnectTimeout)
+	defer cancel()
+	stream, err := tunnel.Agent.GetProxyStream(ctx, proxyOpts)
 	if err != nil {
 		klog.Errorf("l4 proxy get proxy stream from %s error: %w", host, err)
 		return

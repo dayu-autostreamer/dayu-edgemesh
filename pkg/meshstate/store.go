@@ -1,12 +1,8 @@
 package meshstate
 
 import (
-	"bufio"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +16,7 @@ import (
 	"k8s.io/kubernetes/pkg/proxy"
 )
 
-// Store is the in-memory projection of the primary MetaServer-backed Service
+// Store is the in-memory projection of the authoritative Service
 // and Endpoints informers. Writers serialize validation and publication; data
 // plane readers consume immutable snapshots without Kubernetes API calls.
 type Store struct {
@@ -33,32 +29,17 @@ type Store struct {
 	portalApplied map[string]bool   // keyed by Service UID and named port
 	verified      map[string]string // namespaced Service key -> current Service UID
 
-	managedHostsPath string
-	projectionError  string
-	snapshot         atomic.Value // *Snapshot
+	snapshot atomic.Value // *Snapshot
 }
 
 func NewStore() *Store {
-	s, _ := newStore("")
-	return s
-}
-
-// NewStoreWithManagedHosts creates a managed-route store that atomically
-// projects every APPLIED route into a CoreDNS hosts file. The proxy route and
-// DNS record therefore share one validation/source-of-truth boundary.
-func NewStoreWithManagedHosts(path string) (*Store, error) {
-	return newStore(path)
-}
-
-func newStore(managedHostsPath string) (*Store, error) {
 	s := &Store{
-		services:         make(map[string]*v1.Service),
-		endpoints:        make(map[string]*v1.Endpoints),
-		managed:          make(map[string]bool),
-		retiredUIDs:      make(map[types.UID]struct{}),
-		portalApplied:    make(map[string]bool),
-		verified:         make(map[string]string),
-		managedHostsPath: managedHostsPath,
+		services:      make(map[string]*v1.Service),
+		endpoints:     make(map[string]*v1.Endpoints),
+		managed:       make(map[string]bool),
+		retiredUIDs:   make(map[types.UID]struct{}),
+		portalApplied: make(map[string]bool),
+		verified:      make(map[string]string),
 	}
 	initial := &Snapshot{
 		SourceState:   SourceSyncing,
@@ -68,11 +49,8 @@ func newStore(managedHostsPath string) (*Store, error) {
 		servicePorts:  make(map[string]string),
 		serviceUIDs:   make(map[string]string),
 	}
-	if err := writeManagedHostsFile(managedHostsPath, initial); err != nil {
-		return nil, fmt.Errorf("initialize managed runtime DNS projection: %w", err)
-	}
 	s.snapshot.Store(initial)
-	return s, nil
+	return s
 }
 
 func (s *Store) Snapshot() *Snapshot {
@@ -175,21 +153,6 @@ func (s *Store) DeleteService(service *v1.Service) error {
 	defer s.mu.Unlock()
 	s.retiredUIDs[service.UID] = struct{}{}
 	return s.retireServiceLocked(service, "managed Service deleted")
-}
-
-// RetireService removes the locally cached incarnation for a namespaced name
-// after an authoritative API lookup confirms that the Service no longer
-// exists. Edge MetaManager caches can miss delete events, so informer state
-// alone is not sufficient to retain a managed route indefinitely.
-func (s *Store) RetireService(namespace, name, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	service := s.services[namespacedKey(namespace, name)]
-	if service == nil {
-		return nil
-	}
-	s.retiredUIDs[service.UID] = struct{}{}
-	return s.retireServiceLocked(service, reason)
 }
 
 func (s *Store) retireServiceLocked(service *v1.Service, reason string) error {
@@ -311,99 +274,6 @@ func (s *Store) ManagedEndpoint(name proxy.ServicePortName) (endpoint string, ma
 		return "", true, false
 	}
 	return route.Endpoint(), true, snapshot.SourceState == SourceSynced && route.Phase == PhaseApplied
-}
-
-func (s *Store) repairCandidates() []types.NamespacedName {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	projectionFailed := s.projectionError != ""
-	if !projectionFailed && s.snapshot.Load().(*Snapshot).SourceState != SourceSynced {
-		return nil
-	}
-
-	candidates := make([]types.NamespacedName, 0)
-	seen := make(map[string]bool)
-	snapshot := s.snapshot.Load().(*Snapshot)
-	for _, route := range snapshot.Routes {
-		key := route.Key()
-		if seen[key] || !s.managed[key] {
-			continue
-		}
-		// APPLIED routes are already complete. READY and DEGRADED routes are
-		// revalidated by point lookup: this repairs missed informer events and
-		// retires stale Service incarnations left behind by a missed delete.
-		if !projectionFailed && route.Phase == PhaseApplied {
-			continue
-		}
-		// A confirmed delete must stay fail-closed; repair only objects that
-		// are still present but currently violate the managed route contract.
-		if s.services[key] == nil {
-			continue
-		}
-		namespace, name, found := strings.Cut(key, "/")
-		if !found || namespace == "" || name == "" {
-			continue
-		}
-		candidates = append(candidates, types.NamespacedName{Namespace: namespace, Name: name})
-		seen[key] = true
-	}
-	// The userspace proxier and the mesh-state informer consume independent
-	// event streams.  A portal can therefore already exist while the managed
-	// Service Add event was lost completely.  Such a service has no Route to
-	// iterate above, so recover it from MetaServer by namespaced name.  A
-	// confirmed Endpoints deletion retains a degraded Route and is deliberately
-	// handled by the loop above, which still requires both cached objects; it
-	// therefore remains fail-closed.
-	for key, managed := range s.managed {
-		if !managed || seen[key] {
-			continue
-		}
-		hasRoute := false
-		for _, route := range snapshot.Routes {
-			if route.Key() == key {
-				hasRoute = true
-				break
-			}
-		}
-		if hasRoute {
-			continue
-		}
-		namespace, name, found := strings.Cut(key, "/")
-		if !found || namespace == "" || name == "" {
-			continue
-		}
-		candidates = append(candidates, types.NamespacedName{Namespace: namespace, Name: name})
-		seen[key] = true
-	}
-	return candidates
-}
-
-func (s *Store) projectionVerified(name types.NamespacedName) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.verified[namespacedKey(name.Namespace, name.Name)] != ""
-}
-
-func (s *Store) needsAuthoritativeRepair(service *v1.Service) bool {
-	if service == nil || service.Labels[LabelMeshManaged] != "true" {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	snapshot := s.snapshot.Load().(*Snapshot)
-	if s.projectionError != "" || snapshot.SourceState != SourceSynced {
-		return true
-	}
-	key := namespacedKey(service.Namespace, service.Name)
-	for _, route := range snapshot.Routes {
-		if route.Key() != key {
-			continue
-		}
-		return route.ServiceUID != service.UID ||
-			route.ServiceResourceVersion != service.ResourceVersion ||
-			route.Phase != PhaseApplied
-	}
-	return true
 }
 
 // MarkPortalPending is called before a managed userspace portal is opened.
@@ -752,92 +622,6 @@ func (s *Store) publishLocked(next *Snapshot) {
 	}
 	next.Sequence++
 	next.UpdatedAt = time.Now().UTC()
-	if s.projectionError != "" {
-		next.SourceState = SourceSynced
-		next.SourceMessage = "Service, Endpoints and managed DNS projection synced"
-		for runtimeUID, route := range next.Routes {
-			if s.routeAppliedLocked(route) {
-				route.ProxyApplied = true
-				route.Phase = PhaseApplied
-				route.Reason = ""
-			} else if s.verified[route.Key()] == string(route.ServiceUID) {
-				route.ProxyApplied = false
-				route.Phase = PhaseReady
-				route.Reason = "waiting for userspace portal"
-			}
-			next.Routes[runtimeUID] = route
-		}
-	}
-	if err := writeManagedHostsFile(s.managedHostsPath, next); err != nil {
-		s.projectionError = err.Error()
-		failed := cloneSnapshot(next)
-		failed.SourceState = SourceDegraded
-		failed.SourceMessage = "managed runtime DNS projection failed: " + err.Error()
-		s.snapshot.Store(failed)
-		klog.ErrorS(err, "Publish managed runtime DNS projection",
-			"path", s.managedHostsPath, "sequence", next.Sequence)
-		return
-	}
-	s.projectionError = ""
+
 	s.snapshot.Store(next)
-}
-
-func writeManagedHostsFile(path string, snapshot *Snapshot) error {
-	if path == "" {
-		return nil
-	}
-	if snapshot == nil {
-		return fmt.Errorf("managed route snapshot is nil")
-	}
-
-	lines := make([]string, 0, len(snapshot.Routes))
-	if snapshot.SourceState == SourceSynced {
-		for _, route := range snapshot.Routes {
-			if route.Phase != PhaseApplied || net.ParseIP(route.ServiceIP) == nil || route.FQDN == "" {
-				continue
-			}
-			lines = append(lines, route.ServiceIP+" "+route.FQDN)
-		}
-	}
-	sort.Strings(lines)
-
-	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".")
-	if err != nil {
-		return err
-	}
-	tempPath := file.Name()
-	renamed := false
-	defer func() {
-		if !renamed {
-			_ = os.Remove(tempPath)
-		}
-	}()
-
-	if err := file.Chmod(0644); err != nil {
-		_ = file.Close()
-		return err
-	}
-	writer := bufio.NewWriter(file)
-	for _, line := range lines {
-		if _, err := writer.WriteString(line + "\n"); err != nil {
-			_ = file.Close()
-			return err
-		}
-	}
-	if err := writer.Flush(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return err
-	}
-	renamed = true
-	return nil
 }

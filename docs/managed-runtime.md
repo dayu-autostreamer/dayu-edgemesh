@@ -2,107 +2,88 @@
 
 ## Purpose
 
-The managed runtime path gives Dayu a deterministic, revision-scoped route to
-one runtime Pod without making application processes discover Kubernetes
-objects. EdgeMesh projects the Service and Endpoints objects it already
-receives from the KubeEdge MetaServer into immutable in-memory snapshots.
+EdgeMesh provides deterministic, revision-scoped routes without giving Dayu application processes Kubernetes clients.
+DNS and proxy clients use one resolved `kubeAPIConfig`; managed and legacy Services share the proxy's Service/Endpoints
+informers. The managed store validates these events into immutable snapshots. Incomplete or ambiguous managed routes
+remain fail-closed and never fall back to random/legacy endpoint selection.
 
-The design has three hard boundaries:
+For Dayu, configure a real Kubernetes API endpoint reachable from every agent using the existing `master` and/or
+`kubeConfig` fields. There is no private-address discovery, administrative kubeconfig search, second validation client,
+MetaServer fallback on API failure, hosts projection, or managed repair poller.
 
-1. It is label-isolated. Existing `JointMultiEdgeService`, NodePort, and
-   unlabelled Service behavior is preserved while the feature is enabled.
-2. The managed projection reuses only the primary informer and MetaServer
-   client. It adds no second Kubernetes source, hosts file, or EdgeMesh
-   checkpoint. A bounded point lookup runs only for invalid managed
-   projections. The legacy path may retain its independent Kubernetes source.
-3. It is fail-closed. An incomplete or ambiguous managed route never enters
-   the legacy/random load-balancer path.
+## API configuration and availability
 
-KubeEdge MetaManager remains the durable edge-side cache for Service and
-Endpoints objects. EdgeMesh shared informers remain the process cache. The
-managed store is only a validated, immutable projection for data-plane reads.
+```yaml
+kubeAPIConfig:
+  master: https://api.example.com:6443
+  # Optional mounted credentials; master overrides the server in this file.
+  # kubeConfig: /etc/edgemesh/api.kubeconfig
+```
+
+`master` without `kubeConfig` uses in-cluster service-account credentials when available. Otherwise provide a mounted
+kubeconfig with the agent's existing read-only permissions for Services, Endpoints, namespaces, Pods and any enabled
+Istio resources. Use a directly reachable control-plane address and valid CA/server identity; bootstrapping this client
+through a Service IP that requires EdgeMesh itself can create a dependency cycle. No Dayu runtime Pod needs new API
+permissions. Helm uses the same fields under `agent.kubeAPIConfig`.
+
+CoreDNS uses a private generated `dns-kubeconfig` (mode 0600) from the resolved client configuration, including the
+master override, TLS and token-file path. Token rotation remains supported. This is connection configuration, not a
+resource cache. CoreDNS retains its standard Kubernetes plugin/informer and DNS cache; positive TTL stays 30 seconds
+and negative TTL remains bounded to 3 seconds. EdgeProxy and the managed projection share their own informer stream.
+The watch client has no short global HTTP timeout; client-go owns watch renewal and LIST recovery.
+Proxy UID/port validation uses this same Service informer; a separately ordered Namespace watch cannot veto a valid
+Service. DNS and proxy caches are eventually consistent, not atomic: DNS resolution alone does not prove an exact route
+is already APPLIED.
+
+The upstream automatic edge mode still chooses MetaServer when neither `master` nor `kubeConfig` is supplied. That
+explicitly retained configuration mode does **not** bypass KubeEdge cache defects: Dayu deployments requiring this
+recovery must select the real API. No runtime failover silently switches an established source.
+
+During an API outage, already synchronized in-memory caches remain available. API errors are not deletion evidence;
+watch recovery/relist supplies missing updates and deletion tombstones when connectivity returns. A successful empty
+LIST removes even previously `APPLIED` objects. Restarting an agent while disconnected cannot reconstruct its cache
+from the cloud; this design does not add persistent offline metadata or promise recovery of an offline cold start.
 
 ## Compatibility boundary
 
-The feature gate is under `modules.edgeProxy.managedRuntime.enable` and defaults
-to `true` in the Dayu v1.1 distribution so Dayu v1.4 works without a deployment
-override.
-
-| Gate | Managed Service | Legacy Service / JMES / NodePort | Event and validation sources |
-|---|---|---|---|
-| `false` | Not interpreted | Existing behavior | Independent Kubernetes source when available, primary fallback |
-| `true` | Exact managed route, fail-closed | Existing proxy semantics | Managed: primary MetaServer informer only; legacy: independent Kubernetes source when available, primary fallback |
-
-Enabling managed runtime requires EdgeProxy to be enabled and
-`serviceFilterMode: FilterIfLabelExists`. Configuration validation rejects any
-other combination. Rollback is therefore a single configuration change to
-`managedRuntime.enable: false`; no legacy CRD or proxy code is removed.
-
-The raw manifests and Helm chart default to the immutable
-`dayuhub/edgemesh-agent:v1.1` image that contains this implementation. Private
-registries can override `agent.modules.edgeProxy.managedRuntime.image` without
-changing the feature gate.
+`modules.edgeProxy.managedRuntime.enable` defaults to `true` in the Dayu distribution. It requires EdgeProxy and
+`serviceFilterMode: FilterIfLabelExists`. With the gate disabled, legacy routing remains available; with it enabled,
+labelled managed Services use exact identity validation. Both cases use the same configured authoritative API.
 
 ## Dayu v1.3 and v1.4 coexistence
 
-One v1.1 EdgeMesh agent per node can serve both generations concurrently:
-
-- deploy Dayu v1.3 and v1.4 control planes in distinct namespaces;
-- run a single matching dayu-sedna v1.1 GM/LC plane and one dayu-edgemesh v1.1
-  agent DaemonSet across their target nodes;
-- v1.3 JMES/NodePort Services remain unlabelled and use the legacy proxy and
-  load-balancer state;
-- v1.4 RuntimeService Services carry `dayu.io/mesh-managed=true` and use the
-  exact fail-closed projection.
-
-Do not run a second EdgeMesh agent on the same node. Both agents would own the
-same host-network proxy/iptables state and compete for `127.0.0.1:10551`.
-With the gate enabled, the primary MetaServer informer remains authoritative
-only for labelled managed objects. If direct Kubernetes API access is
-available, a separate informer owns only unlabelled legacy Service/Endpoints
-events; otherwise legacy events fall back to the primary informer. This
-restores prompt v1.3 NodePort reconciliation without changing the v1.4 managed
-route source or its fail-closed contract. Label transitions are forwarded once
-by the destination source as an atomic update, so the streams never
-independently delete and add the same Service.
+Use one EdgeMesh agent per node. Unlabelled JMES/NodePort Services retain legacy forwarding semantics; Services labelled
+`dayu.io/mesh-managed=true` use exact RuntimeService routes. Labels select routing behavior, not a different source of
+metadata. Separate Dayu namespaces share the same host proxy. A stale teardown cannot release a replacement's NodePort.
 
 ## Data and acknowledgement flow
 
 ```text
-Sedna RuntimeService controller
-  -> Deployment (one replica on one target node)
-  -> ClusterIP Service (one named TCP port)
-  -> Kubernetes Endpoints controller
-  -> KubeEdge MetaManager / MetaServer
-  -> existing EdgeMesh Service + Endpoints informers
-  -> managed in-memory projection
-  -> DEGRADED-only MetaServer point-lookup repair
-  -> userspace portal lifecycle (PENDING -> APPLIED -> REMOVING -> REMOVED)
+Kubernetes Service + Endpoints
+  -> shared EdgeProxy informers (LIST/WATCH)
+  -> managed identity projection + userspace proxy
+  -> PENDING / APPLIED / REMOVING / REMOVED callbacks
   -> loopback status API
   -> Sedna local-controller activation acknowledgement
 ```
 
-There is no third persistent cache to refresh. Informer handlers do no
-filesystem I/O, and data-plane selection reads an atomic snapshot without
-Kubernetes API calls. After initial informer sync, a repair worker checks only
-managed keys whose Service/Endpoints contract is currently invalid. Every 15
-seconds it performs one bounded Service GET and Endpoints GET through the
-existing MetaServer client, then passes the returned objects through the same
-validation path. Valid routes generate no repair traffic.
+Informer handlers perform no filesystem I/O. Data-plane selection reads an atomic snapshot without API requests.
+`PENDING` marks the Service UID managed before portal creation, even if the projection handler has not run.
+`APPLIED` follows successful portal and load-balancer setup. `REMOVING` closes the route before teardown; `REMOVED`
+follows removal of that incarnation's portal/socket. Final deletion also removes legacy endpoint state, while a
+same-port replacement retains the shared endpoint cache. Failed setup/teardown retries in the existing bounded sync
+loop against the latest desired UID.
 
-The userspace proxier emits `PENDING` before it attempts to program a managed
-portal. This first event records the Service UID and marks the namespaced key as
-managed even if the projection's Service handler has not run yet. The route is
-therefore closed throughout setup. `APPLIED` is emitted only after both portal
-programming and load-balancer registration succeed. `REMOVING` is emitted before
-teardown and keeps the managed tombstone fail-closed; `REMOVED` is emitted only
-after the exact Service incarnation's portal and socket are gone. A final
-delete also removes legacy load-balancer state; a same-port replacement keeps
-the shared endpoint cache so an unchanged legacy Endpoints object is not lost.
-Failed setup and teardown are merged back into the proxier's existing bounded
-sync loop, which always reconciles the latest desired Service UID. Only an exact validated
-projection, source `SYNCED`, and the matching `APPLIED` identity can open the
-route.
+That loop also compares actual NAT/filter rules in the five EdgeMesh userspace chains with active portals. It removes
+orphan rules even if the in-memory entry is gone, including old proxy targets under a reused Service name or NodePort.
+Foundation chains and orphan rules are reconciled before consuming new Service changes or reporting APPLIED. Failed
+initialization, observation or cleanup retains the pending changes for the normal retry loop. Active rules, replacement
+port claims and other owners' chains remain untouched. It does not flush the host ruleset.
+
+TCP accepts proceed independently of endpoint setup, with at most 32 setups per listener. Existing endpoint retry
+budgets now bound actual local dialing and remote libp2p stream/handshake operations. The receiving peer also bounds
+its handshake and endpoint dial. Failures close/reset owned connections; successful streams clear setup deadlines so
+long-lived Redis and task traffic are unaffected. Established streams do not consume setup slots.
 
 ## Resource contract
 
@@ -163,30 +144,8 @@ Newer invalid updates still fail closed. Delete events are UID-guarded so stale
 tombstones cannot remove a newer route. Portal callbacks also carry the exact
 Service UID.
 
-This version guard protects the projection from out-of-order MetaServer watch
-delivery. If MetaManager stores an incomplete object and loses its recovery
-event, the degraded-only point lookup asks the same MetaServer for the current
-Service and Endpoints and can recover the route without a second cloud client.
-The returned objects must still pass the exact contract and proxy
-acknowledgement, so the path remains fail-closed.
-
-The managed repair cannot manufacture freshness when MetaServer's point GET is
-also unavailable or stale. In that source-level failure mode the route remains
-`DEGRADED`; the KubeEdge metadata path must be repaired. EdgeMesh deliberately
-does not bypass MetaServer with a direct cloud API client for managed routing.
-The independent client, when available, is consumed only by unlabelled legacy
-Service/Endpoints reconciliation and stale-object validation.
-
-The proxy's `PENDING` and `REMOVING` lifecycle events force the route out of
-`APPLIED`; `REMOVED` alone may release the tombstone. These transitions cannot
-be masked by informer callback ordering.
-
-`SYNCED` means the primary Service and Endpoints informer caches completed
-their initial synchronization. It is intentionally not presented as a
-continuous MetaServer connection-health signal.
-
-`APPLIED` is a rollout acknowledgement, not a continuous application-health
-signal. Runtime health remains the responsibility of Dayu health monitoring.
+`SYNCED` records completion of initial informer synchronization, not continuous API reachability. `APPLIED` is a
+rollout acknowledgement, not proof of current application health. Dayu owns runtime health checks.
 
 ## Loopback status API
 
@@ -197,7 +156,7 @@ needed.
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | Process status |
-| `GET /readyz` | `200` only after primary Service/Endpoints caches sync |
+| `GET /readyz` | `200` only after Service/Endpoints caches sync |
 | `GET /v1/routes` | Diagnostic snapshot of all projected routes |
 | `GET /v1/routes/{serviceUID}` | Exact activation query by Service UID |
 
@@ -221,7 +180,7 @@ The exact-route endpoint returns:
 ```
 
 The two observed resource versions make it possible to compare EdgeMesh's
-projection with cloud and node-local MetaServer objects without mutating the
+projection with the configured authoritative API objects without mutating the
 resource to provoke another event.
 
 Status codes are `404` for an unknown Service UID, `503` for any route not
@@ -231,24 +190,23 @@ revision or Pod UID is not an activation acknowledgement.
 
 ## Enablement and rollback
 
-1. Deploy matching dayu-sedna v1.1 and dayu-edgemesh v1.1 components. The raw
-   manifests and Helm values already enable managed runtime with a matching
-   image.
-2. Roll out EdgeMesh. For Helm, no feature-specific values are required:
+Configure the reachable authoritative API and build/publish a matching agent image before rollout; repository edits do
+not update an existing `v1.1` image. The raw manifest and Helm values document the API fields without embedding a private
+cluster address. Confirm `/readyz`, an exact Service/RuntimeService/Pod UID activation response, DNS resolution and a
+real request through the Service on each target node. Cache sync alone is not end-to-end validation.
 
-   ```sh
-   helm upgrade --install edgemesh ./build/helm/edgemesh \
-     --namespace kubeedge
-   ```
+Disabling `managedRuntime.enable` disables managed interpretation without changing the API source. Do not mutate a live
+revision in place: create and activate a new revision, publish it, then retire the previous one.
 
-   Override only the image value when using a private registry.
-3. Confirm existing v1.3 JMES/NodePort traffic remains healthy when both
-   generations share the agent.
-4. Confirm `curl -fsS http://127.0.0.1:10551/readyz` succeeds on each node.
-5. Create a v1.4 RuntimeService revision and require an exact `200` activation
-   response before publishing it in Dayu's runtime directory.
-6. Roll back by setting the gate to `false`; legacy resources need no change.
+## Regression tests
 
-Do not mutate a live revision in place. Create a new revision, wait for its
-exact activation, publish it, and then retire the old revision. This keeps the
-Service and Pod UID barrier meaningful and avoids partial routing transitions.
+Use the repository's Go 1.20-compatible vendored dependencies on Linux:
+
+```sh
+go test -mod=vendor ./pkg/clients ./pkg/dns ./pkg/meshstate ./pkg/proxy ./pkg/loadbalancer ./pkg/tunnel
+go test -mod=vendor k8s.io/kubernetes/pkg/proxy/userspace
+```
+
+The tests use fake API watches/iptables, local sockets and in-memory streams. They cover API failure versus confirmed
+delete, relist of applied routes, stale UIDs, orphan kernel rules, replacement NodePorts, concurrent setup and handshake
+timeouts. They do not start an agent, alter host rules, or establish Kubernetes/edge-node deployment correctness.

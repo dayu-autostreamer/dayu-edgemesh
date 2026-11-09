@@ -2,93 +2,73 @@
 
 ## 目标与边界
 
-托管运行时链路为 Dayu 的单个运行时 Pod 提供确定的、按版本隔离的路由，
-并让业务进程彻底退出 Kubernetes 资源发现路径。EdgeMesh 复用现有的
-Service/Endpoints informer，将 KubeEdge MetaServer 已同步到边缘节点的对象
-投影为只读内存快照。
+EdgeMesh 为 Dayu 提供精确、按 revision 隔离的路由，业务进程不访问 Kubernetes。
+DNS 与代理统一使用解析后的 `kubeAPIConfig`；托管和旧 Service 共享代理的 Service/Endpoints informer，
+managed store 将事件验证为不可变内存快照。身份不完整或不一致的托管路由保持失败关闭，不回退随机转发。
 
-该设计有三个硬边界：
+Dayu 应通过现有 `master` / `kubeConfig` 明确选择所有 agent 均可直达的真实 Kubernetes API。
+不再自动猜测私有地址、查找管理员 kubeconfig，或为旧/托管对象维护不同数据源；不再投影 hosts 或定时点查修复。
 
-1. 按标签隔离。开启功能时，原有 `JointMultiEdgeService`、NodePort 和未标记
-   Service 的行为仍然保持不变。
-2. managed 投影只复用主 informer 和 MetaServer client，不为托管链路新增第二个
-   Kubernetes 数据源、hosts 文件或 EdgeMesh 持久化 checkpoint；仅对无效
-   managed 投影执行有界点查。旧链路可以继续使用其独立 Kubernetes 数据源。
-3. 托管对象失败关闭。资源不完整、身份不一致或代理尚未生效时，绝不会回退
-   到旧的随机负载均衡链路。
+## API 配置与可用性
 
-KubeEdge MetaManager 仍是边缘侧 Service/Endpoints 的持久缓存，EdgeMesh
-shared informer 仍是进程缓存；managed store 只负责验证并生成供数据面读取的
-不可变投影，因此不存在第三份需要“强制刷新”的缓存真相。
+```yaml
+kubeAPIConfig:
+  master: https://api.example.com:6443
+  # 可选：挂载认证配置；master 覆盖文件内的 server。
+  # kubeConfig: /etc/edgemesh/api.kubeconfig
+```
+
+只指定 master 时，有可用的 in-cluster ServiceAccount 凭据就继续使用它；否则提供挂载的 kubeconfig。
+复用 agent 原有的 Service、Endpoints、namespace、Pod 及启用的 Istio 资源只读权限，不增加 Dayu 业务 Pod 权限。
+API 地址应直接可达并使用有效 CA/服务端身份，避免通过依赖 EdgeMesh 自身的 Service IP 引导连接。
+Helm 对应 `agent.kubeAPIConfig`，无需增加新的选源开关。
+
+CoreDNS 从相同的已解析配置生成权限为 0600 的 `dns-kubeconfig`，保留 master 覆盖、TLS 与 token 文件路径，
+支持 token 轮转。该文件只保存连接配置，不是资源缓存。CoreDNS 保持标准 Kubernetes 插件及自己的 informer；
+正缓存 TTL 仍为 30 秒，负缓存仍限制为 3 秒。代理与 managed 投影共享另一套 informer 事件流。
+Watch 客户端不再继承短的全局 HTTP 超时，续订和重新 LIST 由 client-go 管理。
+代理的 Service UID/端口校验只依赖同一 Service informer，不用独立 Namespace watch 的到达顺序否定合法 Service。
+DNS 与代理是同源、最终一致的独立缓存；解析成功不代表精确路由已经 APPLIED。
+
+未指定 master/kubeConfig 时，上游自动 edge 模式仍会选择 MetaServer。这个保留的配置模式不能绕过
+KubeEdge 缓存问题；需要本次恢复能力的 Dayu 部署必须选择真实 API。运行中 API 失联不会自动切换元数据来源。
+已有内存缓存继续服务，API 错误不视为删除；连接恢复后由 WATCH/LIST 补齐更新和删除，已 APPLIED 的对象同样会回收。
+离线重启 agent 无法从云端重建缓存，本方案不增加离线持久化，也不保证离线冷启动。
 
 ## 兼容性开关
 
-功能开关为 `modules.edgeProxy.managedRuntime.enable`。Dayu v1.1 发行版默认设置
-为 `true`，因此 Dayu v1.4 部署不需要额外覆盖该配置。
-
-| 开关 | 托管 Service | 旧 Service / JMES / NodePort | 事件与校验来源 |
-|---|---|---|---|
-| `false` | 不识别 | 完全保持原行为 | 可用时使用独立 Kubernetes 数据源，否则回退主数据源 |
-| `true` | 精确路由、失败关闭 | 保持原代理语义 | 托管对象仅使用 MetaServer 主 informer；旧对象可用时使用独立 Kubernetes 数据源，否则回退主 informer |
-
-启用时必须同时启用 EdgeProxy，并设置
-`serviceFilterMode: FilterIfLabelExists`；配置校验会拒绝其他组合。需要回滚时，
-只需将 `managedRuntime.enable` 设回 `false`，旧 CRD 和代理实现均未被删除。
-
-原始清单和 Helm Chart 默认使用包含该实现的不可变镜像
-`dayuhub/edgemesh-agent:v1.1`。使用私有镜像仓库时，只需覆盖
-`agent.modules.edgeProxy.managedRuntime.image`，不需要再修改功能开关。
+`modules.edgeProxy.managedRuntime.enable` 在 Dayu 发行版中默认开启，并要求启用 EdgeProxy 和
+`serviceFilterMode: FilterIfLabelExists`。关闭时仍可使用旧转发语义；开启时带标签的对象遵守精确身份契约。
+两种情况下均使用同一个配置的数据源。
 
 ## Dayu v1.3 与 v1.4 共存
 
-每个节点只部署一个 v1.1 EdgeMesh agent，即可同时承载两代 Dayu：
-
-- 将 Dayu v1.3 和 v1.4 控制面部署在不同 namespace；
-- 在所有目标节点共享一套匹配的 dayu-sedna v1.1 GM/LC，以及一套
-  dayu-edgemesh v1.1 agent DaemonSet；
-- v1.3 的 JMES/NodePort Service 不带 managed 标签，继续走旧代理和负载均衡；
-- v1.4 的 RuntimeService Service 带 `dayu.io/mesh-managed=true`，进入精确、
-  失败关闭的新投影。
-
-不要在同一节点运行第二套 EdgeMesh agent，否则两者会竞争 host network、
-iptables 代理状态以及 `127.0.0.1:10551` 端口。开关开启后，带标签的 managed
-对象仍仅由主 MetaServer informer 负责；若可直连 Kubernetes API，独立 informer
-只负责未标记的旧 Service/Endpoints，否则旧对象回退主 informer。这样既恢复
-v1.3 NodePort 对漏失或陈旧事件的及时协调，也不改变 v1.4 托管路由的数据源和
-fail-closed 契约。标签发生切换时，仅由目标数据源以一次原子 Update 完成交接，
-两个数据源不会分别对同一 Service 执行 Delete/Add。
+每个节点只运行一个 agent。未标记的 JMES/NodePort Service 保留旧转发方式；
+`dayu.io/mesh-managed=true` 的 RuntimeService 使用精确路由。标签决定路由语义，不再决定元数据来源。
+不同 Dayu namespace 共享代理；旧对象清理不会释放新对象已经接管的 NodePort。
 
 ## 数据与确认流程
 
 ```text
-Sedna RuntimeService controller
-  -> 单副本、固定目标节点的 Deployment
-  -> 单端口 ClusterIP Service
-  -> Kubernetes Endpoints controller
-  -> KubeEdge MetaManager / MetaServer
-  -> EdgeMesh 现有 Service + Endpoints informer
-  -> managed 内存投影
-  -> 仅 DEGRADED 状态触发的 MetaServer 点查修复
-  -> userspace portal 生命周期（PENDING -> APPLIED -> REMOVING -> REMOVED）
+Kubernetes Service + Endpoints
+  -> 共享 EdgeProxy informer（LIST/WATCH）
+  -> managed 身份投影 + userspace proxy
+  -> PENDING / APPLIED / REMOVING / REMOVED 回调
   -> 本机状态 API
   -> Sedna local-controller 激活确认
 ```
 
-informer handler 不执行磁盘 I/O；数据面从原子快照取路由，不发起 Kubernetes
-API 请求。主 informer 完成首次同步后，修复 worker 只检查 Service/Endpoints
-契约尚未通过的 managed key；每 15 秒通过现有 MetaServer client 分别执行一次
-有超时边界的 Service GET 和 Endpoints GET，并将返回对象送回同一验证路径。
-已经有效的路由不会产生修复请求。
+handler 不执行文件 I/O，数据面不访问 API。PENDING 在安装 portal 前标记精确 Service UID；
+只有 portal 和负载均衡注册成功才进入 APPLIED。REMOVING 先关闭路由，精确 portal/socket 清除后进入 REMOVED。
+最终删除清理旧 endpoint 状态，同端口替换保留共享 endpoint 缓存。安装/拆除失败继续进入既有的限频协调循环。
 
-userspace proxier 会在尝试写入托管 portal 前先发出 `PENDING`。该事件携带精确
-Service UID，并立即将 namespaced key 标记为 managed；即使它早于投影侧的
-Service handler 到达，路由也会从第一刻起失败关闭。只有 portal 写入和负载均衡
-注册均成功后才发出 `APPLIED`。拆除前先进入 `REMOVING` 并保留 managed
-tombstone；只有当前 Service 实例的 portal 和 socket 全部清除后才进入
-`REMOVED`。最终删除还会清除旧负载均衡状态；同端口替换则保留共享 endpoint
-缓存，避免 Endpoints 对象未变化时旧链路丢失后端。初始化和拆除失败统一重新并入
-proxier 现有的限频同步循环，并始终只协调最新期望 Service UID。因此必须同时满足精确投影、
-source 为 `SYNCED`、且相同身份已 `APPLIED`，路由才能打开。
+协调还检查内核中 EdgeMesh 自有五条 NAT/filter 链，按当前 portal 删除内存里已经没有的孤儿规则、
+复用名称/NodePort 下指向旧代理端口的规则。先完成基础链与孤儿规则协调，再消费新 Service 变更和报告 APPLIED；
+初始化、读取或清理失败时保留待处理变更，由原协调循环重试。保留活跃规则和新对象端口占用，不清空主机规则或其他组件的链。
+
+TCP 接收与连接建立分开，每个 listener 最多同时建立 32 条连接；已建立连接不占该额度。
+原有 endpoint 重试预算用于约束真实 Dial、libp2p stream 建立和握手，接收端同样限制握手与本地拨号。
+失败关闭/reset 所有已取得的连接；成功清除建立阶段的 deadline，保留 Redis 和任务传输长连接。
 
 ## 资源契约
 
@@ -141,24 +121,8 @@ RuntimeService UID 和 endpoint Pod UID 共同区分对象实例并防止 ABA �
 fail-closed。Delete 事件按 UID 防护，陈旧 tombstone 不会删除新路由。portal
 回调同样携带精确 Service UID。
 
-该版本防护用于阻止 MetaServer watch 乱序投递破坏当前投影。如果 MetaManager
-保存了不完整对象但丢失后续恢复事件，仅针对无效投影的点查会通过同一个
-MetaServer 获取当前 Service 和 Endpoints，无需第二个云端 client 即可恢复。
-返回对象仍须通过完整资源契约和代理确认，因此链路继续保持 fail-closed。
-
-如果 managed 路径的 MetaServer 点查本身也不可用或返回陈旧对象，EdgeMesh
-无法凭空制造新鲜数据，路由会继续保持 `DEGRADED`，此时必须修复 KubeEdge
-元数据链路。EdgeMesh 不会为 managed 路由绕过 MetaServer 直接连接云端 API。
-独立 client（若可用）只供未标记旧 Service/Endpoints 的协调与陈旧对象校验使用。
-
-代理侧 `PENDING` 和 `REMOVING` 都会让路由退出 `APPLIED`；只有 `REMOVED`
-才能释放 tombstone。这些状态不会因 informer handler 的先后顺序而短暂误开。
-
-`SYNCED` 只表示主 Service/Endpoints informer 已完成首次 cache 同步，刻意不把
-它描述为持续的 MetaServer 连接健康信号。
-
-`APPLIED` 是发布/滚动升级屏障，不是持续的业务健康度。运行时健康仍由 Dayu
-健康检查负责。
+SYNCED 仅代表首次 informer 同步完成，不代表持续 API 可达；APPLIED 是发布确认，不是应用实时健康。
+运行时健康仍由 Dayu 检查。
 
 ## 本机状态 API
 
@@ -168,14 +132,13 @@ hostNetwork，因此无需额外暴露 Kubernetes Service。
 | 接口 | 含义 |
 |---|---|
 | `GET /healthz` | 进程存活状态 |
-| `GET /readyz` | 主 Service/Endpoints cache 完成同步后才返回 `200` |
+| `GET /readyz` | Service/Endpoints cache 完成同步后才返回 `200` |
 | `GET /v1/routes` | 所有投影路由的诊断快照 |
 | `GET /v1/routes/{serviceUID}` | 按精确 Service UID 查询激活状态 |
 
 精确查询响应包含 Service UID、RuntimeService UID、当前观察到的 Service 和
 Endpoints resourceVersion、endpoint Pod UID、deployment revision、runtime ID、
-target node、本地序列号和 source 状态。两个 resourceVersion 可直接与云端及
-节点本机 MetaServer 对象对比，不需要再通过修改 annotation 人为触发事件。
+target node、本地序列号和 source 状态。两个 resourceVersion 可直接与配置的权威 API 对象对比，不需要再通过修改 annotation 人为触发事件。
 未知 UID 返回
 `404`；任一状态未达到 `APPLIED + SYNCED` 返回 `503`；只有身份与状态均精确
 匹配时返回 `200`。调用方仍必须逐一比较身份字段，不能把其他 revision 或 Pod
@@ -183,22 +146,21 @@ UID 的 `200` 当作本版本的激活确认。
 
 ## 启用与回滚
 
-1. 部署匹配的 dayu-sedna v1.1 和 dayu-edgemesh v1.1。原始清单与 Helm values
-   已默认开启 managed runtime 并指定匹配镜像。
-2. 滚动部署 EdgeMesh；Helm 不再需要功能相关的额外参数：
+配置真实 API 并编译发布匹配的 agent 镜像后再部署；仓库修改不会更新已存在的 v1.1 镜像。
+原始清单与 Helm values 给出配置字段，不写死私有集群地址。逐节点验证 readyz、精确 UID 激活响应、
+DNS 和真实 Service 请求；缓存同步成功不能替代端到端验证。
 
-   ```sh
-   helm upgrade --install edgemesh ./build/helm/edgemesh \
-     --namespace kubeedge
-   ```
+关闭 managedRuntime.enable 只关闭托管解释，不改变 API 来源。不要原地修改已发布 revision；
+创建新 revision、等待精确激活、发布目录后再回收旧版本。
 
-   仅在使用私有仓库时覆盖镜像值。
-3. 当两代系统共享 agent 时，确认 v1.3 的 JMES/NodePort 流量保持正常。
-4. 在每个节点确认 `curl -fsS http://127.0.0.1:10551/readyz` 成功。
-5. 创建 v1.4 RuntimeService revision；只有精确状态查询返回 `200` 后，才将其
-   发布到 Dayu runtime directory。
-6. 回滚时将开关恢复为 `false`，旧资源无需修改。
+## 回归验证
 
-不要原地修改已发布 revision。应创建新 revision，等待精确激活，发布新目录
-记录，最后回收旧 revision。这样才能保持 Service/Pod UID 屏障的有效性，避免
-半完成的路由切换。
+使用兼容当前 vendored 依赖的 Go 1.20，在 Linux 执行：
+
+```sh
+go test -mod=vendor ./pkg/clients ./pkg/dns ./pkg/meshstate ./pkg/proxy ./pkg/loadbalancer ./pkg/tunnel
+go test -mod=vendor k8s.io/kubernetes/pkg/proxy/userspace
+```
+
+测试使用假 API/iptables、本地 socket 和内存 stream，覆盖失联与删除、APPLIED 路由重新 LIST、旧 UID、
+内核孤儿规则、NodePort 复用、建连并发与握手超时。不启动 agent、不修改主机规则，也不替代真实集群验证。

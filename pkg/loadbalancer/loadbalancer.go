@@ -1,6 +1,7 @@
 package loadbalancer
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -969,23 +970,27 @@ func (lb *LoadBalancer) TryConnectEndpoints(service proxy.ServicePortName, srcAd
 		}
 		klog.InfoS("Mapped service to endpoint", "service", service, "endpoint", endpoint)
 		// NOTE: outConn can be a net.Conn(golang) or network.Stream(libp2p)
-		outConn, err := lb.dialEndpoint(protocol, endpoint)
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		outConn, err := lb.dialEndpoint(ctx, protocol, endpoint)
+		cancel()
 		if err != nil {
 			if netutil.IsTooManyFDsError(err) {
 				panic("Dial failed: " + err.Error())
 			}
 			klog.ErrorS(err, "Dial failed", "endpoint:", endpoint)
 			sessionAffinityReset = true
-			time.Sleep(dialTimeout)
 			continue
 		}
 		if req != nil {
 			reqBytes, err := netutil.HTTPRequestToBytes(req)
 			if err == nil {
+				_ = outConn.SetWriteDeadline(time.Now().Add(dialTimeout))
 				_, err = outConn.Write(reqBytes)
-				if err != nil {
-					return nil, err
-				}
+				_ = outConn.SetWriteDeadline(time.Time{})
+			}
+			if err != nil {
+				_ = outConn.Close()
+				return nil, err
 			}
 		}
 		return outConn, nil
@@ -994,7 +999,7 @@ func (lb *LoadBalancer) TryConnectEndpoints(service proxy.ServicePortName, srcAd
 }
 
 // dialEndpoint If the endpoint contains node name then try to dial stream conn or try to dial net conn.
-func (lb *LoadBalancer) dialEndpoint(protocol, endpoint string) (net.Conn, error) {
+func (lb *LoadBalancer) dialEndpoint(ctx context.Context, protocol, endpoint string) (net.Conn, error) {
 	targetNode, targetPod, targetIP, targetPort, ok := parseEndpoint(endpoint)
 	if !ok {
 		return nil, fmt.Errorf("invalid endpoint %s", endpoint)
@@ -1003,9 +1008,7 @@ func (lb *LoadBalancer) dialEndpoint(protocol, endpoint string) (net.Conn, error
 
 	switch targetNode {
 	case defaults.EmptyNodeName, lb.Config.NodeName:
-		// TODO: This could spin up a new goroutine to make the outbound connection,
-		// and keep accepting inbound traffic.
-		outConn, err := net.Dial(protocol, net.JoinHostPort(targetIP, targetPort))
+		outConn, err := (&net.Dialer{}).DialContext(ctx, protocol, net.JoinHostPort(targetIP, targetPort))
 		if err != nil {
 			return nil, err
 		}
@@ -1017,7 +1020,7 @@ func (lb *LoadBalancer) dialEndpoint(protocol, endpoint string) (net.Conn, error
 			return nil, fmt.Errorf("invalid endpoint %s", endpoint)
 		}
 		proxyOpts := tunnel.ProxyOptions{Protocol: protocol, NodeName: targetNode, IP: targetIP, Port: int32(targetPort)}
-		streamConn, err := tunnel.Agent.GetProxyStream(proxyOpts)
+		streamConn, err := tunnel.Agent.GetProxyStream(ctx, proxyOpts)
 		if err != nil {
 			return nil, fmt.Errorf("get proxy stream from %s error: %v", targetNode, err)
 		}

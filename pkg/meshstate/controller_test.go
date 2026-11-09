@@ -1,209 +1,98 @@
 package meshstate
 
 import (
-	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/tools/cache"
 )
 
-type fakeManagedObjectGetter struct {
-	service      *v1.Service
-	endpoints    *v1.Endpoints
-	serviceList  *v1.ServiceList
-	listErr      error
-	serviceErr   error
-	endpointsErr error
-	calls        []string
+func awaitProjection(t *testing.T, condition func() bool) {
+	t.Helper()
+	if err := wait.PollImmediate(10*time.Millisecond, 10*time.Second, func() (bool, error) { return condition(), nil }); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func (f *fakeManagedObjectGetter) ListManagedServices(_ context.Context) (*v1.ServiceList, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
-	if f.serviceList == nil {
-		return &v1.ServiceList{}, nil
-	}
-	return f.serviceList.DeepCopy(), nil
-}
-
-func (f *fakeManagedObjectGetter) GetService(_ context.Context, namespace, name string) (*v1.Service, error) {
-	f.calls = append(f.calls, "services/"+namespace+"/"+name)
-	if f.serviceErr != nil {
-		return nil, f.serviceErr
-	}
-	return f.service.DeepCopy(), nil
-}
-
-func (f *fakeManagedObjectGetter) GetEndpoints(_ context.Context, namespace, name string) (*v1.Endpoints, error) {
-	f.calls = append(f.calls, "endpoints/"+namespace+"/"+name)
-	if f.endpointsErr != nil {
-		return nil, f.endpointsErr
-	}
-	return f.endpoints.DeepCopy(), nil
-}
-
-func TestControllerRepairsOnlyInvalidManagedProjection(t *testing.T) {
-	store := NewStore()
+func TestRelistRemovesAppliedRouteButAPIErrorPreservesIt(t *testing.T) {
 	service, endpoints := managedObjects("service-a", "runtime-service-a")
-	service.ResourceVersion = "20"
-	endpoints.ResourceVersion = "20"
+	var mu sync.Mutex
+	items := []v1.Service{*service}
+	unavailable, failures := false, 0
+	watches := make(chan *watch.RaceFreeFakeWatcher, 4)
+	services := cache.NewSharedIndexInformer(&cache.ListWatch{
+		ListFunc: func(metav1.ListOptions) (runtime.Object, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if unavailable {
+				failures++
+				return nil, errors.New("API unavailable")
+			}
+			return &v1.ServiceList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}, Items: items}, nil
+		},
+		WatchFunc: func(metav1.ListOptions) (watch.Interface, error) {
+			w := watch.NewRaceFreeFake()
+			watches <- w
+			return w, nil
+		},
+	}, &v1.Service{}, 0, cache.Indexers{})
+	eps := cache.NewSharedIndexInformer(&cache.ListWatch{
+		ListFunc: func(metav1.ListOptions) (runtime.Object, error) {
+			return &v1.EndpointsList{Items: []v1.Endpoints{*endpoints}}, nil
+		},
+		WatchFunc: func(metav1.ListOptions) (watch.Interface, error) { return watch.NewRaceFreeFake(), nil },
+	}, &v1.Endpoints{}, 0, cache.Indexers{})
+	store := NewStore()
+	stop := make(chan struct{})
+	defer close(stop)
+	NewController(store).Register(services, eps, stop)
+	go services.Run(stop)
+	go eps.Run(stop)
+	awaitProjection(t, func() bool {
+		route, ok := store.Snapshot().Routes["runtime-service-a"]
+		return ok && route.Phase == PhaseReady && store.Snapshot().SourceState == SourceSynced
+	})
+	store.MarkPortalApplied(service.UID, servicePortName(service), true)
+	if requireRoute(t, store, "runtime-service-a").Phase != PhaseApplied {
+		t.Fatal("route did not become applied")
+	}
+	w := <-watches
+	mu.Lock()
+	unavailable = true
+	items = nil
+	mu.Unlock()
+	// 410 forces a new LIST, whose errors must not be interpreted as absence.
+	w.Error(&metav1.Status{Code: 410, Reason: metav1.StatusReasonExpired})
+	awaitProjection(t, func() bool { mu.Lock(); defer mu.Unlock(); return failures > 0 })
+	if requireRoute(t, store, "runtime-service-a").Phase != PhaseApplied {
+		t.Fatal("API error retired a valid cached route")
+	}
+	mu.Lock()
+	unavailable = false
+	mu.Unlock()
+	awaitProjection(t, func() bool { _, exists := store.Snapshot().Routes["runtime-service-a"]; return !exists })
+}
+
+func TestDeleteTombstoneCannotRetireReplacementUID(t *testing.T) {
+	store := NewStore()
+	service, endpoints := managedObjects("service-new", "runtime-service-new")
 	applyManagedRoute(t, store, service, endpoints)
-	store.MarkSourceSynced()
-	store.MarkPortalApplied(service.UID, servicePortName(service), true)
-
-	client := &fakeManagedObjectGetter{service: service.DeepCopy(), endpoints: endpoints.DeepCopy()}
+	old := service.DeepCopy()
+	old.UID = "service-old"
 	controller := NewController(store)
-	controller.repairManagedObjects(client)
-	if len(client.calls) != 0 {
-		t.Fatalf("valid projection triggered repair requests: %#v", client.calls)
+	controller.onServiceDelete(cache.DeletedFinalStateUnknown{Obj: old})
+	if _, ok := store.Snapshot().Routes["runtime-service-new"]; !ok {
+		t.Fatal("old tombstone removed replacement")
 	}
-
-	invalid := endpoints.DeepCopy()
-	invalid.ResourceVersion = "21"
-	invalid.Subsets = nil
-	if err := store.UpsertEndpoints(invalid); err != nil {
-		t.Fatalf("degrade endpoints: %v", err)
-	}
-	if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseDegraded {
-		t.Fatalf("invalid Endpoints did not degrade route: %#v", route)
-	}
-
-	recovered := endpoints.DeepCopy()
-	recovered.ResourceVersion = "22"
-	client.endpoints = recovered
-	client.calls = nil
-	controller.repairManagedObjects(client)
-
-	if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
-		t.Fatalf("MetaServer point lookup did not recover route: %#v", route)
-	}
-	wantCalls := []string{"services/default/runtime-a", "endpoints/default/runtime-a"}
-	if len(client.calls) != len(wantCalls) || client.calls[0] != wantCalls[0] || client.calls[1] != wantCalls[1] {
-		t.Fatalf("repair calls = %#v, want %#v", client.calls, wantCalls)
-	}
-
-	if err := store.DeleteEndpoints(recovered); err != nil {
-		t.Fatalf("delete endpoints: %v", err)
-	}
-	client.endpointsErr = apierrors.NewNotFound(
-		schema.GroupResource{Resource: "endpoints"},
-		recovered.Name,
-	)
-	client.calls = nil
-	controller.repairManagedObjects(client)
-	if len(client.calls) != len(wantCalls) || client.calls[0] != wantCalls[0] || client.calls[1] != wantCalls[1] {
-		t.Fatalf("authoritative Endpoints recheck calls = %#v, want %#v", client.calls, wantCalls)
-	}
-	if route := requireRoute(t, store, "runtime-service-a"); route.Phase != PhaseDegraded {
-		t.Fatalf("deleted Endpoints route reopened: %#v", route)
-	}
-}
-
-func TestControllerRecoversManagedPortalWithCompletelyMissingProjection(t *testing.T) {
-	store := NewStore()
-	service, endpoints := managedObjects("service-a", "runtime-service-a")
-	service.ResourceVersion = "20"
-	endpoints.ResourceVersion = "20"
-	store.MarkSourceSynced()
-
-	// The proxier observed the managed Service and opened its portal, but the
-	// independent mesh-state informer missed the Service/Endpoints Add events.
-	store.MarkPortalPending(service.UID, servicePortName(service))
-	store.MarkPortalApplied(service.UID, servicePortName(service), true)
-	if _, exists := store.Snapshot().Routes["runtime-service-a"]; exists {
-		t.Fatal("test setup unexpectedly created a managed route")
-	}
-
-	client := &fakeManagedObjectGetter{
-		service:   service.DeepCopy(),
-		endpoints: endpoints.DeepCopy(),
-	}
-	NewController(store).repairManagedObjects(client)
-
-	route := requireRoute(t, store, "runtime-service-a")
-	if route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
-		t.Fatalf("missing managed projection was not recovered: %#v", route)
-	}
-	wantCalls := []string{
-		"services/default/runtime-a",
-		"endpoints/default/runtime-a",
-	}
-	if len(client.calls) != len(wantCalls) ||
-		client.calls[0] != wantCalls[0] ||
-		client.calls[1] != wantCalls[1] {
-		t.Fatalf("repair calls = %#v, want %#v", client.calls, wantCalls)
-	}
-}
-
-func TestControllerDiscoversServiceMissedByBothManagedConsumers(t *testing.T) {
-	store := NewStore()
-	service, endpoints := managedObjects("service-a", "runtime-service-a")
-	service.ResourceVersion = "20"
-	endpoints.ResourceVersion = "20"
-	store.MarkSourceSynced()
-
-	client := &fakeManagedObjectGetter{
-		serviceList: &v1.ServiceList{Items: []v1.Service{*service.DeepCopy()}},
-		endpoints:   endpoints.DeepCopy(),
-	}
-	controller := NewController(store)
-	controller.repairProxy = func(recoveredService *v1.Service, recoveredEndpoints *v1.Endpoints) {
-		if recoveredService.UID != service.UID || recoveredEndpoints == nil || recoveredEndpoints.UID != endpoints.UID {
-			t.Fatalf("proxy repair received wrong objects: service=%#v endpoints=%#v", recoveredService, recoveredEndpoints)
-		}
-		store.MarkPortalPending(recoveredService.UID, servicePortName(recoveredService))
-		store.MarkPortalApplied(recoveredService.UID, servicePortName(recoveredService), true)
-	}
-	controller.repairManagedObjects(client)
-
-	route := requireRoute(t, store, "runtime-service-a")
-	if route.Phase != PhaseApplied || route.EndpointPodUID != "pod-a" {
-		t.Fatalf("authoritative discovery did not recover fully missed route: %#v", route)
-	}
-	wantCalls := []string{"endpoints/default/runtime-a"}
-	if len(client.calls) != len(wantCalls) || client.calls[0] != wantCalls[0] {
-		t.Fatalf("discovery calls = %#v, want %#v", client.calls, wantCalls)
-	}
-}
-
-func TestControllerRetiresReadyProjectionMissingFromAuthoritativeAPI(t *testing.T) {
-	store := NewStore()
-	service, endpoints := managedObjects("service-a", "runtime-service-a")
-	if err := store.UpsertService(service); err != nil {
-		t.Fatalf("upsert service: %v", err)
-	}
-	if err := store.UpsertEndpoints(endpoints); err != nil {
-		t.Fatalf("upsert endpoints: %v", err)
-	}
-	store.MarkSourceSynced()
-
-	route := requireRoute(t, store, "runtime-service-a")
-	if route.Phase != PhaseReady {
-		t.Fatalf("route phase = %s, want %s", route.Phase, PhaseReady)
-	}
-
-	client := &fakeManagedObjectGetter{
-		serviceErr: apierrors.NewNotFound(
-			schema.GroupResource{Resource: "services"},
-			service.Name,
-		),
-	}
-	NewController(store).repairManagedObjects(client)
-
-	if _, exists := store.Snapshot().Routes["runtime-service-a"]; exists {
-		t.Fatal("authoritatively missing Service remained in managed route snapshot")
-	}
-	if err := store.UpsertService(service); err != nil {
-		t.Fatalf("replay retired Service event: %v", err)
-	}
-	if _, exists := store.Snapshot().Routes["runtime-service-a"]; exists {
-		t.Fatal("replayed informer event restored an authoritatively retired Service")
-	}
-	wantCalls := []string{"services/default/runtime-a"}
-	if len(client.calls) != len(wantCalls) || client.calls[0] != wantCalls[0] {
-		t.Fatalf("repair calls = %#v, want %#v", client.calls, wantCalls)
+	controller.onServiceDelete(cache.DeletedFinalStateUnknown{Obj: service})
+	if _, ok := store.Snapshot().Routes["runtime-service-new"]; ok {
+		t.Fatal("current tombstone retained route")
 	}
 }

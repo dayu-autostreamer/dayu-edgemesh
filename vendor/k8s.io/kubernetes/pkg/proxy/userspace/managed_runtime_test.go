@@ -494,3 +494,21 @@ func TestManagedPortalCallbacksCarryExactUIDAndLifecycleOrder(t *testing.T) {
 		t.Fatal("legacy Service emitted a managed portal lifecycle callback")
 	}
 }
+
+func TestServiceUIDValidationIgnoresLaggingNamespaceCache(t *testing.T) {
+	service := testService("new-namespace", "redis", "tcp", "10.0.0.12", 6379, 0)
+	service.UID = "current"
+	proxier := &Proxier{}
+	proxier.SetNamespaceExistsHandler(func(string) bool { return false })
+	proxier.SetServiceUIDExistsHandler(func(name proxy.ServicePortName, uid types.UID) bool {
+		return uid == service.UID && name.Port == "tcp"
+	})
+	if ports := proxier.currentServicePortNames(service); !ports.Has("tcp") {
+		t.Fatal("a current Service was discarded because its Namespace event arrived later")
+	}
+	old := service.DeepCopy()
+	old.UID = "old"
+	if ports := proxier.currentServicePortNames(old); ports.Len() != 0 {
+		t.Fatal("stale Service UID was admitted")
+	}
+}

@@ -20,47 +20,24 @@ We decide the forwarding in scheduler of dayu system, thus unexpected forwarding
 
 ### EdgeProxy State Reconciliation
 
-This version also improves the stability of EdgeProxy service state on edge nodes.
+DNS, legacy proxying and managed routing use the same configured Kubernetes API authority. For Dayu, select a real
+API endpoint reachable from every agent through `kubeAPIConfig.master` and/or `kubeConfig` (Helm:
+`agent.kubeAPIConfig`). API errors preserve the last synchronized cache; client-go LIST/WATCH recovery supplies missing
+updates and deletes. Automatic edge mode still uses MetaServer if neither field is set, so configure the real API to
+bypass KubeEdge metadata-cache defects. There is no automatic source failover or administrative kubeconfig discovery.
 
-In some edge deployments, deleted services may still exist in KubeEdge MetaServer cache for a period of time. In the original behavior, these stale services could be restored into `iptables` after `edgemesh-agent` restarted, which might cause:
-
-- deleted services and namespaces to "revive" in `KUBE-PORTALS-*` and `KUBE-NODEPORT-*`
-- `Failed to ensure portal` errors caused by stale `NodePort` conflicts
-- current live services to be blocked by dirty proxy state
-
-To avoid this problem, Dayu-Edgemesh now adds an extra validation path before keeping service state in userspace proxy:
-
-- prefer native in-cluster Kubernetes API access
-- fallback to serviceaccount token plus the real apiserver address discovered from `default/kubernetes` Endpoints
-- fallback to well-known kubeconfig paths such as `/etc/kubeedge/config/kubeconfig`
-
-With this change, stale services from deleted namespaces are filtered out from proxy state and cleaned from `iptables`, while current live services can still be programmed normally.
-
-If direct validation is not available on a device, `edgemesh-agent` will log:
-```text
-Falling back to primary Kubernetes client for EdgeMesh proxy validation
-```
-
-If direct validation is enabled successfully, `edgemesh-agent` will log:
-```text
-Using independent Kubernetes API source for legacy EdgeMesh proxy recovery
-```
-
-When managed runtime is enabled, this independent source owns only unlabelled
-legacy Service and Endpoints events. Managed objects remain exclusively on the
-primary MetaServer informer path. A stale teardown that finds its NodePort
-already owned by a replacement Service preserves the replacement claim and
-finishes removing only the stale proxy state.
+The userspace proxy reconciles both in-memory portals and actual rules in its own NAT/filter chains. Stale Service
+incarnations and orphan rules are removed while active routes and replacement NodePorts remain intact. TCP setup is
+bounded and concurrent; dial/handshake failures cannot indefinitely block the listener. Established connections retain
+their normal lifetime.
 
 ### RuntimeService Data Path
 
-Dayu-Edgemesh now includes a revision-scoped data path for Sedna
-`RuntimeService` workloads. It replaces per-runtime Kubernetes discovery with
-one local, in-memory projection built from EdgeProxy's existing Service and
-Endpoints informers. The managed projection adds no watch, Kubernetes client,
-hosts file, or persistent cache. A bounded point-lookup repair uses the same
-MetaServer client only while a managed projection is invalid. The independent
-Kubernetes source described above is isolated to legacy routing recovery.
+Dayu-Edgemesh provides a revision-scoped data path for Sedna RuntimeServices. The managed projection reuses EdgeProxy's
+Service/Endpoints informers, validates exact Service/RuntimeService/Pod UIDs, and fails closed until its portal is applied.
+CoreDNS keeps its standard Kubernetes plugin with the same resolved endpoint and credentials. No hosts projection,
+managed repair poller or persistent resource cache is added. An agent restarted offline cannot rebuild cloud metadata.
+See the [architecture and API configuration](docs/managed-runtime.md) for the complete availability boundary.
 
 Dayu EdgeMesh enables this path by default for Dayu v1.4:
 
@@ -73,16 +50,17 @@ modules:
       enable: true
 ```
 
-The raw manifests and Helm chart already pair this configuration with the
-same-revision `dayuhub/edgemesh-agent:v1.1` image. A clean deployment therefore
-needs no RuntimeService-specific override:
+The raw manifests and Helm chart enable this managed contract by default and
+retain the `dayuhub/edgemesh-agent:v1.1` image default. When rolling out changes
+from this branch, build and select a matching image and configure the reachable
+API endpoint before installation:
 
 ```sh
 helm upgrade --install edgemesh ./build/helm/edgemesh \
   --namespace kubeedge
 ```
 
-Private registries only need to override
+For a private registry, also override
 `agent.modules.edgeProxy.managedRuntime.image` or the image in
 `build/agent/resources/05-daemonset.yaml`; the gate and filter mode do not need
 to be edited.
@@ -91,13 +69,9 @@ The gate adds exact routing only for ClusterIP Services labelled
 `dayu.io/mesh-managed=true`; unlabelled Services retain legacy proxy behavior.
 This allows one v1.1 agent on each node to serve Dayu v1.3 JMES/NodePort traffic
 and Dayu v1.4 RuntimeService traffic in different namespaces at the same time.
-Managed Services continue to use only the primary MetaServer-backed informer.
-When direct Kubernetes API access is available, unlabelled legacy Services and
-Endpoints use the independent source for prompt recovery from a missed or stale
-MetaServer event; otherwise they fall back to the primary informer. The two
-event streams are label-disjoint, and a label transition is handed over as one
-atomic update. Set the gate to `false` only when rolling back to the exact
-pre-managed validation behavior.
+Both service types use the configured authoritative API and one proxy event stream. Disabling the managed gate
+changes routing interpretation only; it does not switch data sources. Configure the API fields above before rollout,
+and publish an image built from this source revision.
 
 A managed route becomes selectable only after all of the following agree on
 the same revision and Kubernetes object incarnation:

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"text/template"
@@ -31,12 +30,6 @@ const (
         denial 9984 3 1
     }
     errors
-    hosts {{.ManagedRuntimeHostsFile}} cluster.local {
-        ttl 5
-        reload 1s
-        no_reverse
-        fallthrough
-    }
     forward . {{.UpstreamServers}} {
         force_tcp
     }
@@ -63,13 +56,12 @@ const (
 // stubDomainInfo contains all the parameters needed to compute
 // a stubDomain block in the Corefile.
 type stubDomainInfo struct {
-	DomainName              string
-	LocalIP                 string
-	Port                    string
-	CacheTTL                int
-	UpstreamServers         string
-	KubernetesPlugin        string
-	ManagedRuntimeHostsFile string
+	DomainName       string
+	LocalIP          string
+	Port             string
+	CacheTTL         int
+	UpstreamServers  string
+	KubernetesPlugin string
 }
 
 type KubernetesPluginInfo struct {
@@ -77,23 +69,9 @@ type KubernetesPluginInfo struct {
 	TTL       int
 }
 
-func getKubernetesPluginStr(cfg *v1alpha1.EdgeDNSConfig) (string, error) {
-	var apiServer string
-	if cfg.KubeAPIConfig.Master != "" {
-		endpointStr := fmt.Sprintf("endpoint %s", cfg.KubeAPIConfig.Master)
-		apiServer += endpointStr
-	}
-	if cfg.KubeAPIConfig.KubeConfig != "" {
-		kubeConfigStr := fmt.Sprintf("kubeconfig %s \"\"", cfg.KubeAPIConfig.KubeConfig)
-		if apiServer == "" {
-			apiServer += kubeConfigStr
-		} else {
-			apiServer += "\n        " + kubeConfigStr
-		}
-	}
-
+func getKubernetesPluginStr() (string, error) {
 	info := &KubernetesPluginInfo{
-		APIServer: apiServer,
+		APIServer: fmt.Sprintf("kubeconfig %s \"\"", defaults.TempDNSKubeConfigPath),
 		TTL:       defaultTTL,
 	}
 	var tpl bytes.Buffer
@@ -126,12 +104,6 @@ func getStubDomainStr(stubDomainMap map[string][]string, info *stubDomainInfo) (
 
 // copy from https://github.com/kubernetes/dns/blob/1.21.0/cmd/node-cache/app/configmap.go and update
 func UpdateCorefile(cfg *v1alpha1.EdgeDNSConfig, kubeClient kubernetes.Interface) error {
-	// The hosts plugin requires the file to exist when CoreDNS starts. EdgeProxy
-	// atomically replaces this file as managed routes converge.
-	if err := os.WriteFile(defaults.ManagedRuntimeHostsFilePath, nil, 0644); err != nil {
-		return fmt.Errorf("initialize managed runtime hosts file %s: %w", defaults.ManagedRuntimeHostsFilePath, err)
-	}
-
 	// get listen ip
 	ListenIP, err := netutil.GetInterfaceIP(cfg.ListenInterface)
 	if err != nil {
@@ -140,7 +112,7 @@ func UpdateCorefile(cfg *v1alpha1.EdgeDNSConfig, kubeClient kubernetes.Interface
 
 	cacheTTL := defaultTTL
 	upstreamServers := []string{defaultUpstreamServer}
-	kubernetesPlugin, err := getKubernetesPluginStr(cfg)
+	kubernetesPlugin, err := getKubernetesPluginStr()
 	if err != nil {
 		return err
 	}
@@ -175,11 +147,10 @@ func UpdateCorefile(cfg *v1alpha1.EdgeDNSConfig, kubeClient kubernetes.Interface
 	stubDomainMap := make(map[string][]string)
 	stubDomainMap["."] = upstreamServers
 	stubDomainStr, err := getStubDomainStr(stubDomainMap, &stubDomainInfo{
-		LocalIP:                 ListenIP.String(),
-		Port:                    fmt.Sprintf("%d", cfg.ListenPort),
-		CacheTTL:                cacheTTL,
-		KubernetesPlugin:        kubernetesPlugin,
-		ManagedRuntimeHostsFile: defaults.ManagedRuntimeHostsFilePath,
+		LocalIP:          ListenIP.String(),
+		Port:             fmt.Sprintf("%d", cfg.ListenPort),
+		CacheTTL:         cacheTTL,
+		KubernetesPlugin: kubernetesPlugin,
 	})
 	if err != nil {
 		return err

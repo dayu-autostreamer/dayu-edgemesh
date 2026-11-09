@@ -2,7 +2,9 @@ package userspace
 
 import (
 	"bytes"
+	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -483,7 +485,18 @@ func (f *fakeIPTables) Protocol() iptables.Protocol {
 	return iptables.ProtocolIPv4
 }
 
-func (f *fakeIPTables) SaveInto(iptables.Table, *bytes.Buffer) error {
+func (f *fakeIPTables) SaveInto(table iptables.Table, buffer *bytes.Buffer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for chain, rules := range f.rules[table] {
+		for key := range rules {
+			args := strings.Split(key, "\x00")
+			for i := range args {
+				args[i] = strconv.Quote(args[i])
+			}
+			fmt.Fprintf(buffer, "-A %s %s\n", chain, strings.Join(args, " "))
+		}
+	}
 	return nil
 }
 

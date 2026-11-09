@@ -9,6 +9,12 @@ metadata:
 data:
   edgemesh-agent.yaml: |
     # For more detailed configuration, please refer to: https://edgemesh.netlify.app/reference/config-items.html#edgemesh-agent-cfg
+    # Dayu: select a real API reachable from every node; no runtime source fallback.
+    # With master alone, mounted in-cluster ServiceAccount credentials are used.
+    # Otherwise supply an explicit mounted kubeconfig with read-only agent access.
+    # kubeAPIConfig:
+    #   master: https://api.example.com:6443
+    #   kubeConfig: /etc/edgemesh/api.kubeconfig
     modules:
       edgeProxy:
         enable: true
