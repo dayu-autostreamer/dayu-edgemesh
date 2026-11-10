@@ -17,10 +17,15 @@ RUN apk update && apk --no-cache add iptables && apk --no-cache add dpkg
 
 COPY --from=builder /code/_output/local/bin/edgemesh-agent /usr/local/bin/edgemesh-agent
 
-# Add support for auto-detection of iptables mode
+# Add support for auto-detection of iptables mode. Every backend must retain
+# save/restore slaves when the wrapper switches the selected alternative.
 COPY --from=builder /code/build/agent/iptables-wrapper /sbin/iptables-wrapper
-RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-legacy 50
-RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-nft 50
+RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-legacy 50 \
+    --slave /sbin/iptables-save iptables-save /sbin/iptables-legacy-save \
+    --slave /sbin/iptables-restore iptables-restore /sbin/iptables-legacy-restore
+RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-nft 50 \
+    --slave /sbin/iptables-save iptables-save /sbin/iptables-nft-save \
+    --slave /sbin/iptables-restore iptables-restore /sbin/iptables-nft-restore
 RUN update-alternatives --install /sbin/iptables iptables /sbin/iptables-wrapper 100 \
     --slave /sbin/iptables-restore iptables-restore /sbin/iptables-wrapper \
     --slave /sbin/iptables-save iptables-save /sbin/iptables-wrapper

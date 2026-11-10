@@ -210,3 +210,21 @@ go test -mod=vendor k8s.io/kubernetes/pkg/proxy/userspace
 The tests use fake API watches/iptables, local sockets and in-memory streams. They cover API failure versus confirmed
 delete, relist of applied routes, stale UIDs, orphan kernel rules, replacement NodePorts, concurrent setup and handshake
 timeouts. They do not start an agent, alter host rules, or establish Kubernetes/edge-node deployment correctness.
+
+Validate agent packaging as well as Go tests: selecting either iptables backend must preserve its matching
+`iptables-save` and `iptables-restore` links. Otherwise kernel reconciliation cannot read rules and pending Service
+updates cannot activate. The wrapper and both backend alternatives register the complete command family. Check a built
+image in an isolated network namespace before rollout:
+
+```sh
+docker run --rm --network none --cap-add NET_ADMIN --entrypoint sh <agent-image> -ec '
+  iptables --version
+  iptables-save -t nat >/dev/null
+  iptables-restore --version
+  for mode in legacy nft; do
+    update-alternatives --set iptables /sbin/iptables-$mode
+    iptables-save --version
+    iptables-restore --version
+  done
+'
+```

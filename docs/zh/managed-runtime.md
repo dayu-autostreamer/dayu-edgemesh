@@ -164,3 +164,8 @@ go test -mod=vendor k8s.io/kubernetes/pkg/proxy/userspace
 
 测试使用假 API/iptables、本地 socket 和内存 stream，覆盖失联与删除、APPLIED 路由重新 LIST、旧 UID、
 内核孤儿规则、NodePort 复用、建连并发与握手超时。不启动 agent、不修改主机规则，也不替代真实集群验证。
+
+除 Go 测试外，还要验证 agent 镜像：自动选择或手动切换 legacy/nft 后，必须保留对应的
+`iptables-save`、`iptables-restore` 链接，否则内核规则协调失败，待处理 Service 无法激活。
+wrapper 和两个后端都注册完整的 alternatives 命令族。发布前可用英文版文档中的容器检查命令，
+在 `--network none` 的独立网络命名空间内验证，不读取或修改主机规则。
